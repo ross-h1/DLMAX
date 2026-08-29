@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the software and the accompanying paper."
+title: "DLMAX: Dynamic Linear Models in JAX"
+abstract: >-
+  A JAX-based framework for Dynamic Linear Models with Discount Model
+  Averaging, for fitting and forecasting large panels of time series.
+type: software
+authors:
+  - family-names: Hollyman
+    given-names: Ross
+    orcid: "https://orcid.org/0000-0002-0535-0013"
+    email: hello@awenforecasting.com
+version: 0.1.0
+license: Apache-2.0
+repository-code: "https://github.com/ross-h1/DLMAX"
+keywords:
+  - dynamic linear models
+  - state space models
+  - Bayesian forecasting
+  - model averaging
+  - JAX
+  - time series
+# When the paper is published, complete the fields below (journal, year,
+# volume, pages / DOI) so that `preferred-citation` resolves to it.
+preferred-citation:
+  type: article
+  title: "Forecasting: Fast and Slow"
+  authors:
+    - family-names: Hollyman
+      given-names: Ross
+      orcid: "https://orcid.org/0000-0002-0535-0013"
+  journal: "TBD"
+  year: 2026

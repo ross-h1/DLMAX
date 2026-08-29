@@ -1,0 +1,130 @@
+---
+title: "DLMAX"
+subtitle: "Dynamic Linear Models in JAX"
+jupyter: python3
+---
+
+DLMAX provides an implementation of the @west_harrison_1997 Bayesian dynamic linear model (DLM) for time series forecasting. We start with the fundamental assumption that model parameters and model form are uncertain, but that we can learn something about both from observed data. The DLM deals mostly with model-level parameters, and is augmented by a dynamic model averaging framework (DMA) [@raftery_dma_2010].
+
+This approach means that rather than committing to a single model, DLMAX filters a whole *universe* of
+candidate models (combinations of level, trend, seasonal and discount settings) in parallel and combines their forecasts — weighting each model by its recent predictive performance, so the blend adapts over time.
+
+Both modelling approaches are fundamentally *sequential* in nature, meaning that new data is processed *once* post-observation, and we avoid endless, wasteful re-fitting of old data.
+
+The models are exposed through a high-level API and implemented in JAX for vectorised, device-parallel filtering.
+
+
+::: {.callout-note}
+## Alpha release
+
+`v0.1.0`. The numerics are tested and stable, but this is a `0.x` release and
+the public API may change between minor versions
+([semver](https://semver.org/#spec-item-4)) — pin an exact version if you
+depend on it. Bug reports and questions are welcome via
+[GitHub Issues](https://github.com/ross-h1/DLMAX/issues).
+:::
+
+## Installation
+
+```bash
+pip install awen-dlmax
+```
+
+The distribution is published as **`awen-dlmax`**; the import name is
+`DLMAX`.
+
+DLMAX requires 64-bit floats. Enable them once at process start:
+
+```python
+from DLMAX import enable_x64
+enable_x64()  # or set JAX_ENABLE_X64=1 in the environment
+```
+
+```{python}
+#| include: false
+# Setup for the executed examples: 64-bit floats, quiet import noise, chart theme.
+import os
+os.environ["TQDM_DISABLE"] = "1"
+import warnings
+warnings.filterwarnings("ignore")
+from DLMAX import enable_x64
+enable_x64()
+import seaborn as sns
+sns.set_theme(style="whitegrid", context="notebook")
+```
+
+## Input format
+
+Series are supplied as a pandas DataFrame in either shape, detected
+automatically and giving identical results.
+
+**Long** — one row per observation, columns `(unique_id, ds, y)`: the series
+name, the timestamp (or an integer index), and the observation. Series may
+differ in length and need not share a calendar.
+
+**Wide** — one row per period: the index is the timestamp, each column is a
+series, and the column names are the series ids. A series that starts late or
+ends early is `NaN` in those cells, and missing values are carried through the
+filter as missing rather than imputed.
+
+Wide input is converted to long internally, and forecasts come back keyed the
+way the input was.
+
+## Quick start
+
+Load the bundled airline-passengers series and forecast 24 months ahead:
+
+```{python}
+from DLMAX import AutoFFS, load_dataset
+
+df = load_dataset("airline_passengers")          # 144 monthly obs, long format
+forecast = AutoFFS(season_length=12).forecast(df, h=24, level=[80, 95])
+forecast.head()
+```
+
+```{python}
+#| label: fig-quickstart
+#| fig-cap: "AutoFFS 24-month forecast with 80% and 95% prediction intervals."
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(8, 4))
+sns.lineplot(data=df, x="ds", y="y", color="0.35", label="history", ax=ax)
+sns.lineplot(data=forecast, x="ds", y="AutoFFS", color="C0", label="forecast", ax=ax)
+for lo, hi, alpha in [("AutoFFS-lo-95", "AutoFFS-hi-95", 0.15),
+                      ("AutoFFS-lo-80", "AutoFFS-hi-80", 0.25)]:
+    ax.fill_between(forecast["ds"], forecast[lo], forecast[hi], color="C0", alpha=alpha)
+ax.set(xlabel="", ylabel="passengers")
+ax.legend()
+plt.show()
+```
+
+Input is long-format: a DataFrame with `unique_id`, `ds`, `y` columns —
+exactly what [`load_dataset`](reference/load_dataset.qmd) returns. The same model
+also supports persistent `fit` / `predict` / `update` and a single-pass
+`cross_validation` backtest — see [Three ways to use it](#three-ways-to-use-it)
+below.
+
+## Three ways to use it
+
+- **Persistent** — [`fit`](reference/AutoFFS.qmd) once, then
+  [`predict`](reference/AutoFFS.qmd) / [`update`](reference/AutoFFS.qmd)
+  repeatedly. Each datapoint is filtered exactly once; ideal for sequential or
+  streaming use.
+- **Stateless** — [`forecast`](reference/AutoFFS.qmd) runs a one-shot fit +
+  predict, for when the state is not needed afterwards.
+- **Backtest** — [`cross_validation`](reference/AutoFFS.qmd) emits rolling-origin
+  forecasts from a single forward pass.
+
+For very large panels with series entering and leaving over time, see
+[`AutoFFSUniverse`](reference/AutoFFSUniverse.qmd), which manages a persistent,
+length-batched universe on disk. The lower-level
+[`uv_dlm`](reference/uv_dlm.qmd) and
+[`multi_model_dlm`](reference/multi_model_dlm.qmd) classes expose the underlying
+filter directly.
+
+See the [API Reference](reference/index.qmd) for the full public API.
+
+## References
+
+::: {#refs}
+:::

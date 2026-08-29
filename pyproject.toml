@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "awen-dlmax"
+# The IMPORT name stays `DLMAX`; only the distribution name is prefixed.
+# PyPI rejects "dlmax" as confusable with the existing "dimax" (l/i/1 are
+# treated as interchangeable to block typosquatting), and `awen-` claims a
+# namespace rather than competing for a generic one.
+version = "0.1.0"
+description = "Dynamic Linear Models in JAX"
+authors = [{name = "Ross Hollyman", email = "hello@awenforecasting.com"}]
+# A project role address, not a personal one: `author_email` is PUBLIC and
+# PERMANENT -- served by the PyPI JSON API and baked into every wheel, and an
+# immutable release cannot be amended, only yanked. This one also outlives any
+# institutional affiliation.
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+readme = "README.md"
+requires-python = ">=3.11"
+# The distribution name is brand-led, so these carry the discoverability:
+# PyPI search matches on description, keywords and classifiers.
+keywords = [
+    "dynamic linear models", "state space models", "bayesian forecasting",
+    "model averaging", "time series", "forecasting", "jax", "kalman filter",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "jax>=0.4",
+    "numpyro>=0.15",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.0",
+    "matplotlib>=3.8",
+    "h5py>=3.16.0",
+]
+
+[project.optional-dependencies]
+gpu = ["jax[cuda12]; sys_platform == 'linux'"]
+# cross_validation(output="xarray") and the netCDF-writing paths.
+xarray = ["xarray>=2023.1", "h5netcdf>=1.0"]
+dev = [
+    "pytest>=7.0",
+    "xarray>=2023.1",
+    "ruff>=0.6",
+    "jupyter",
+]
+
+[project.urls]
+Homepage = "https://github.com/ross-h1/DLMAX"
+Repository = "https://github.com/ross-h1/DLMAX"
+Issues = "https://github.com/ross-h1/DLMAX/issues"
+
+[tool.setuptools.package-data]
+# Ship the bundled example datasets (DLMAX.datasets) inside the wheel.
+DLMAX = ["data/*.csv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+docs = [
+    "quartodoc>=0.11",
+    # griffe 2.0 changed the parse_numpy signature that quartodoc 0.11 still
+    # calls (allow_section_blank_line); pin to the 1.x line until quartodoc
+    # supports griffe 2.x.
+    "griffe>=1.5,<2",
+    # Jupyter engine so Quarto can execute the {python} code blocks; seaborn
+    # (over the core matplotlib dependency) for the charts.
+    "jupyter",
+    "ipykernel",
+    "seaborn",
+]

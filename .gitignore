@@ -1,0 +1,28 @@
+<# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build / install metadata
+*.egg-info/
+build/
+dist/
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+
+# Claude
+.claude/
+claude.md

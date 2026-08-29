@@ -1,0 +1,110 @@
+project:
+  type: website
+  output-dir: _site
+  # Regenerate the API reference from the docstrings before every render.
+  # quartodoc build is a SEPARATE command from quarto render, so without this
+  # the pages under reference/ are only as current as the last manual run --
+  # they are gitignored, so a stale copy is invisible to everyone but the
+  # person rendering.
+  pre-render:
+    - python -m quartodoc build
+
+website:
+  title: "DLMAX"
+  description: "Dynamic Linear Models in JAX"
+  navbar:
+    left:
+      - text: Home
+        href: index.qmd
+      # Tutorials are held back pending review and are not exported, so the
+      # nav must not link them: a menu entry pointing at a notebook that is not
+      # in the tree fails the site build rather than degrading. Restore this
+      # block alongside the notebooks.
+      #
+      # - text: Tutorials
+      #   menu:
+      #     - text: Forecasting
+      #       href: tutorials/forecasting.ipynb
+      #     - text: DLMAX walkthrough
+      #       href: "tutorials/dlmax tutorial.ipynb"
+      #     - text: "1 — Estimation on M4 Yearly"
+      #       href: "tutorials/M4 Yearly Part1.ipynb"
+      #     - text: "2 — Choosing discount rates"
+      #       href: "tutorials/M4 Yearly Part 2.ipynb"
+      #     - text: "3 — From wings to blocks"
+      #       href: "tutorials/M4 Yearly Part 3.ipynb"
+      #     - text: "4 — Blocks from constituents"
+      #       href: "tutorials/M4 Yearly Part 4.ipynb"
+      #     - text: "5 — Many series at once"
+      #       href: "tutorials/M4 Yearly Part 5.ipynb"
+      #     - text: "6 — Streaming with block_builder"
+      #       href: "tutorials/M4 Yearly Part 6.ipynb"
+      - text: Reference
+        href: reference/index.qmd
+    right:
+      - icon: github
+        href: https://github.com/ross-h1/DLMAX
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+
+# Project-wide bibliography. Cite in any .qmd with [@key]; a References
+# section renders automatically on pages that cite.
+bibliography: references.bib
+
+# Execute {python} code blocks via the Jupyter engine (docs dependency group).
+# freeze: auto re-runs a page only when its source changes; warnings are
+# hidden so library import noise stays out of the rendered output.
+execute:
+  freeze: auto
+  warning: false
+
+# Use the project venv's Jupyter kernel (registered via
+# `python -m ipykernel install --user --name dlmax-docs` from .venv).
+jupyter: dlmax-docs
+
+# quartodoc generates the API reference pages under reference/ from the
+# package docstrings. The `contents` lists below ARE the public API surface:
+# keep them in sync with DLMAX.__all__.
+quartodoc:
+  package: DLMAX
+  dir: reference
+  title: API Reference
+  style: pkgdown
+  render_interlinks: true
+  sections:
+    - title: Forecasting
+      desc: High-level forecasting API.
+      contents:
+        - AutoFFS
+        - AutoFFSUniverse
+        - FFSPredictive
+        - UniverseContext
+    - title: Model classes
+      desc: Lower-level dynamic linear model building blocks.
+      contents:
+        - uv_dlm
+        - multi_model_dlm
+    - title: Smoothing
+      desc: >
+        Retrospective (fixed-interval) smoothing and backward sampling.
+        Prefer `uv_dlm.smooth()` / `.backward_sample()`; the free functions are
+        exported but provisional — their signatures may change (see the
+        `DLMAX.smoother` module docstring).
+      contents:
+        - rts_smooth
+        - ffbs
+        - SmootherError
+    - title: Setup
+      desc: Device and floating-point precision configuration.
+      contents:
+        - configure_devices
+        - enable_x64
+        - require_x64
+    - title: Datasets
+      desc: Small bundled example datasets for the quickstart.
+      contents:
+        - load_dataset
+        - available_datasets
