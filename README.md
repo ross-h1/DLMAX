@@ -128,7 +128,7 @@ df = pd.concat(frames, ignore_index=True)
 # with 80% and 95% predictive intervals.
 model = AutoFFS(season_length=12)
 model.fit(df, freq="MS")
-forecast = model.predict(h=12, level=[80, 95])
+forecast = model.forecast(h=12, level=[80, 95])
 
 print(forecast.head())
 ```
@@ -152,7 +152,7 @@ df_new = pd.DataFrame({
 })
 
 model.update(df_new)            # one filter pass over the new rows only
-forecast = model.predict(h=12)  # forecast from the advanced state
+forecast = model.forecast(h=12)  # forecast from the advanced state
 ```
 
 `fit(history)` then `update(new)` gives the same answer as `fit(history + new)`
@@ -205,7 +205,7 @@ panel has any of those, and before changing the core filter.
 ```bash
 git clone https://github.com/ross-h1/DLMAX.git
 cd DLMAX
-uv sync --extra dev      # or: pip install -e ".[dev]"
+uv sync                  # installs the `dev` dependency group by default
 pytest                   # runs the fast suite
 pytest -m slow           # also runs the slower numerical tests
 ```

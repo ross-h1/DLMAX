@@ -8,7 +8,7 @@ name = "awen-dlmax"
 # PyPI rejects "dlmax" as confusable with the existing "dimax" (l/i/1 are
 # treated as interchangeable to block typosquatting), and `awen-` claims a
 # namespace rather than competing for a generic one.
-version = "0.1.0"
+version = "0.2.0"
 description = "Dynamic Linear Models in JAX"
 authors = [{name = "Ross Hollyman", email = "hello@awenforecasting.com"}]
 # A project role address, not a personal one: `author_email` is PUBLIC and
@@ -36,11 +36,9 @@ classifiers = [
 ]
 dependencies = [
     "jax>=0.4",
-    "numpyro>=0.15",
     "numpy>=1.26",
     "scipy>=1.11",
     "pandas>=2.0",
-    "matplotlib>=3.8",
     "h5py>=3.16.0",
 ]
 
@@ -48,12 +46,6 @@ dependencies = [
 gpu = ["jax[cuda12]; sys_platform == 'linux'"]
 # cross_validation(output="xarray") and the netCDF-writing paths.
 xarray = ["xarray>=2023.1", "h5netcdf>=1.0"]
-dev = [
-    "pytest>=7.0",
-    "xarray>=2023.1",
-    "ruff>=0.6",
-    "jupyter",
-]
 
 [project.urls]
 Homepage = "https://github.com/ross-h1/DLMAX"
@@ -71,8 +63,20 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 
 [dependency-groups]
+# Development tooling lives HERE and not in [project.optional-dependencies].
+# Both existed until 0.2.0, with different contents: `uv sync` installs this
+# group by default while `uv sync --extra dev` installed the extra, so the
+# documented setup command and the default one produced different environments
+# (ruff was in the extra and therefore never actually installed). PEP 735 groups
+# are also absent from published metadata, which is correct -- `pip install
+# awen-dlmax[dev]` should not exist, because ruff is not a feature of DLMAX.
 dev = [
-    "pytest>=9.0.3",
+    "pytest>=7.0",
+    "ruff>=0.6",
+    # Not imported by the suite: these back cross_validation(output="xarray")
+    # and the netCDF writers, which are exercised by hand.
+    "xarray>=2023.1",
+    "h5netcdf>=1.0",
 ]
 docs = [
     "quartodoc>=0.11",
@@ -80,9 +84,12 @@ docs = [
     # calls (allow_section_blank_line); pin to the 1.x line until quartodoc
     # supports griffe 2.x.
     "griffe>=1.5,<2",
-    # Jupyter engine so Quarto can execute the {python} code blocks; seaborn
-    # (over the core matplotlib dependency) for the charts.
+    # Jupyter engine so Quarto can execute the {python} code blocks; matplotlib
+    # and seaborn for the charts in docs/tutorials/*.ipynb. matplotlib is named
+    # explicitly because it stopped being a core dependency in 0.2.0 -- it would
+    # otherwise arrive only as a transitive dependency of seaborn.
     "jupyter",
     "ipykernel",
+    "matplotlib>=3.8",
     "seaborn",
 ]

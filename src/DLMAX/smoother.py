@@ -314,6 +314,15 @@ def ffbs(key, traj, G, disc, n_draws=1, right_factor=None, smoothed=None):
     smoothed : dict, optional
         Reuse an existing :func:`rts_smooth` result instead of recomputing it.
 
+        May carry a **shared** covariance path: if its ``B``/``sqrtH``/``S`` have
+        a series axis of length 1 while ``traj["m"]`` has ``q`` series, the path
+        broadcasts across all of them. This is the Quintana/West case -- ``C*`` is
+        common to every series, so a per-series copy is pure redundancy (at
+        ``T=95, q=304, p=14`` it is 90 MB of duplicated gains). Pass
+        ``right_factor`` explicitly when doing this: the default
+        ``L = diag(sqrt(s_T))`` is built from ``smoothed["scale"]`` and cannot be
+        formed from a one-series path.
+
     Returns
     -------
     array, shape ``(n_draws, T, q, p)``
@@ -333,8 +342,14 @@ def ffbs(key, traj, G, disc, n_draws=1, right_factor=None, smoothed=None):
          if right_factor is None else jnp.asarray(right_factor))
 
     def shape_noise(root, z):
-        """root @ z, then couple across series by L on the right."""
-        return L @ jnp.einsum("qij,qj->qi", root, z)      # (q,q) @ (q,p)
+        """root @ z, then couple across series by L on the right.
+
+        ``matmul`` rather than ``einsum`` so that a root carrying a leading axis
+        of 1 BROADCASTS across the q series -- see the note on ``smoothed``.
+        With matching leading axes this is the same operation as
+        ``einsum("qij,qj->qi", root, z)``.
+        """
+        return L @ (root @ z[..., None])[..., 0]          # (q,q) @ (q,p)
 
     def one(k):
         kT, krest = random.split(k)
@@ -342,7 +357,9 @@ def ffbs(key, traj, G, disc, n_draws=1, right_factor=None, smoothed=None):
 
         def back(theta_next, xs):
             m_t, B_t, a_t1, sqrtH_t, z_t = xs
-            h = m_t + jnp.einsum("qij,qj->qi", B_t, theta_next - a_t1)
+            # matmul, not einsum: lets a shared (1,p,p) gain broadcast over the
+            # q series. Identical when B_t already carries a full q axis.
+            h = m_t + (B_t @ (theta_next - a_t1)[..., None])[..., 0]
             theta = h + shape_noise(sqrtH_t, z_t)
             return theta, theta
 

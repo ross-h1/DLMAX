@@ -1273,6 +1273,48 @@ class ErrorSpec:
 # ---------------------------------------------------------------------------
 
 
+
+@dataclass(frozen=True)
+class DlmDesign:
+    """The model DEFINITION, detached from any filter that runs it.
+
+    What :meth:`DLM.design` returns: the matrices and priors the components
+    imply, with none of the filter runtime a compiled :class:`~DLMAX.dlm_core.uv_dlm`
+    carries (``device``, ``adapt``, ``n_pad``, ``monitor``, variance discounting).
+
+    Exists because a caller may want the design without the filter. The
+    Quintana/West multivariate DLM in BayesFR is the motivating case: it needs
+    ``F``, ``G`` and the per-state discounts, supplies its own priors (its ``C0``
+    is SHARED across series and scale-free, its ``V0`` a prior scale rather than
+    an observation variance), and must not inherit filter settings it then has to
+    override. Reaching into a compiled ``uv_dlm`` for this works but means
+    transposing shapes and discarding fields, which is a smell.
+
+    ``disc_norm`` and ``disc_damped`` are returned SEPARATELY, deliberately. The
+    filter applies their product, and for a damped trend that puts
+    ``disc * phi**2`` on the growth slot -- a value a caller may need to override
+    (BayesFR does, and records why). Composing them is the caller's business.
+    """
+
+    F: jnp.ndarray
+    G: jnp.ndarray
+    regression_G: Optional[jnp.ndarray]
+    disc_norm: jnp.ndarray
+    disc_damped: jnp.ndarray
+    mult_comps: jnp.ndarray
+    monitor_inject: jnp.ndarray
+    m0: jnp.ndarray
+    C0: jnp.ndarray
+    V0: jnp.ndarray
+    nu0: jnp.ndarray
+    state_names: tuple
+
+    @property
+    def applied_disc(self):
+        """``disc_norm * disc_damped`` -- what the filter actually applies."""
+        return self.disc_norm * self.disc_damped
+
+
 class DLM:
     """Configurable DLM specification.
 
@@ -1415,36 +1457,15 @@ class DLM:
         if self.family == "Gaussian" and self.error_spec is None:
             raise ValueError("Gaussian DLM requires set_error(...) before compile().")
 
-    def compile(
-        self,
-        init_data: pd.DataFrame,
-        device=None,
-        warmup_steps: Optional[int] = None,
-        h: Optional[int] = None,
-        monitor=None,
-    ) -> uv_dlm:
-        """Run prior elicitation and return a ``uv_dlm`` instance.
+    def design(self, init_data, warmup_steps: Optional[int] = None) -> "DlmDesign":
+        """The model definition, without constructing a filter.
 
-        Parameters
-        ----------
-        init_data : pd.DataFrame
-            Time series used for prior elicitation. Shape (T, n_series),
-            with each column a series. The mean feeds the initial location,
-            the state variance is used to ensure diffuse initial state variance.
-        device : NamedSharding, optional
-            Defaults to ``DLMAX.ffs.devices.host_device``.
-        warmup_steps : int, optional
-            number of steps to keep discount rate = 1 for mximum learning
-            of initial state
-        h : int, optional
-            Forecast horizon. If set, ``GH`` is precomputed for the
-            returned ``uv_dlm``, enabling efficient ``forecast(h)``.
+        Everything :meth:`compile` derives from the components -- ``F``, ``G``,
+        the per-state discounts, the elicited priors -- returned as a
+        :class:`DlmDesign`. ``compile`` is this plus ``uv_dlm(...)``, so there is
+        one place the design is built and the two cannot drift.
 
-        Returns
-        -------
-        uv_dlm
-            Ready for filtering. Equivalent to the output of
-            :func:`Mcomp_DLM` for matching parameter combinations.
+        For callers that run their own filter. See :class:`DlmDesign`.
         """
         self._validate(init_data)
 
@@ -1531,6 +1552,58 @@ class DLM:
 
         nu0 = jnp.ones(n) * self.error_spec.nu0
 
+        return DlmDesign(
+            F=F, G=G, regression_G=regression_G,
+            disc_norm=disc_norm, disc_damped=disc_damped,
+            mult_comps=mult_comps, monitor_inject=monitor_inject,
+            m0=m0, C0=C0, V0=V0, nu0=nu0,
+            state_names=tuple(c.name for c in
+                              ([c for c in self.components if not c.is_regression]
+                               + [c for c in self.components if c.is_regression])),
+        )
+
+    def compile(
+        self,
+        init_data: pd.DataFrame,
+        device=None,
+        warmup_steps: Optional[int] = None,
+        h: Optional[int] = None,
+        monitor=None,
+    ) -> uv_dlm:
+        """Run prior elicitation and return a ``uv_dlm`` instance.
+
+        Parameters
+        ----------
+        init_data : pd.DataFrame
+            Time series used for prior elicitation. Shape (T, n_series),
+            with each column a series. The mean feeds the initial location,
+            the state variance is used to ensure diffuse initial state variance.
+        device : NamedSharding, optional
+            Defaults to ``DLMAX.ffs.devices.host_device``.
+        warmup_steps : int, optional
+            number of steps to keep discount rate = 1 for mximum learning
+            of initial state
+        h : int, optional
+            Forecast horizon. If set, ``GH`` is precomputed for the
+            returned ``uv_dlm``, enabling efficient ``forecast(h)``.
+
+        Returns
+        -------
+        uv_dlm
+            Ready for filtering. Equivalent to the output of
+            :func:`Mcomp_DLM` for matching parameter combinations.
+        """
+        d = self.design(init_data, warmup_steps=warmup_steps)
+        F, G, regression_G = d.F, d.G, d.regression_G
+        disc_norm, disc_damped = d.disc_norm, d.disc_damped
+        monitor_inject, mult_comps = d.monitor_inject, d.mult_comps
+        m0, C0, V0, nu0 = d.m0, d.C0, d.V0, d.nu0
+        n = self.n_series
+        structural = [c for c in self.components if not c.is_regression]
+        regression = [c for c in self.components if c.is_regression]
+        ordered = structural + regression
+        n_regs_total = sum(c.n_regs for c in regression)
+
         if device is None:
             device = devices.host_device
 
@@ -1539,7 +1612,6 @@ class DLM:
         # value passed by compile_universe overrides it. False -> legacy static.
         if monitor is None:
             monitor = self._monitor_value
-
         result = uv_dlm(
             series_ids=jnp.arange(n),
             F=F,

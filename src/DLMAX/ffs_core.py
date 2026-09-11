@@ -3221,31 +3221,60 @@ def _multiblock_advance(blocks, union_state, arr, union_pdr, union_mdr,
     literally the same code.
     """
     a = np.asarray(arr, dtype=float)
-    dma, union_mi = _union_allocator([b.model_indicator for b in blocks],
-                                     a.shape[1], union_pdr, union_mdr, dma_c)
-    if learn_dma:
-        from .ffs.discount_grid import sgd_union_step_q, DMA_PRIOR
-        dp = dma_prior if dma_prior is not None else DMA_PRIOR
-    else:
-        step = dma.prepared_step()
+    ctx = _multiblock_dma_ctx(blocks, a.shape[1], union_pdr, union_mdr,
+                              dma_c, learn_dma, dma_prior)
     state, weights = union_state, None
     for t in range(a.shape[0]):
-        f1s, q1s = [], []
-        for b in blocks:
-            _b, (F, Q) = b.fwd_filter(a[t], return_trace=True)      # F (q, M_b)
-            f1s.append(F)
-            q1s.append(Q)
-        f1 = jnp.asarray(np.concatenate(f1s, axis=1).T)             # (M, q)
-        q1 = jnp.asarray(np.concatenate(q1s, axis=1).T)
-        if learn_dma:
-            state, w = sgd_union_step_q(state, f1, q1, jnp.asarray(a[t]), 0.0,
-                                        mi=union_mi, c=dma_c, dma_prior=dp)
-            weights = np.asarray(w)
-        else:
-            state, w = step(state, ForecastBundle(f1[..., None], q1[..., None]),
-                            jnp.asarray(a[t]))
-            weights = np.asarray(w[:, :, 0])
+        state, weights, _f1, _q1 = _multiblock_step(blocks, state, a[t], ctx)
     return state, weights
+
+
+def _multiblock_dma_ctx(blocks, q, union_pdr, union_mdr, dma_c=1e-3,
+                        learn_dma=False, dma_prior=None):
+    """Build the union allocator ONCE, for reuse across steps.
+
+    Separated from the advance because ``fwd_filter`` steps one observation at a
+    time: rebuilding the allocator per step would be both wasteful and wrong,
+    since ``prepared_step`` compiles against it.
+    """
+    dma, union_mi = _union_allocator([b.model_indicator for b in blocks],
+                                     q, union_pdr, union_mdr, dma_c)
+    if learn_dma:
+        from .ffs.discount_grid import DMA_PRIOR
+        return {"learn": True, "mi": union_mi, "c": dma_c,
+                "prior": dma_prior if dma_prior is not None else DMA_PRIOR}
+    return {"learn": False, "step": dma.prepared_step()}
+
+
+def _multiblock_step(blocks, state, yt, ctx):
+    """ONE union advance over ``yt`` ``(q,)``.
+
+    Each block takes the row through ``fwd_filter`` while the union allocator is
+    stepped on the per-worker one-step trace the blocks just produced. This is
+    the body :func:`_multiblock_advance` loops and the body ``AutoFFS.fwd_filter``
+    calls once -- shared so the step and scan faces cannot drift apart.
+
+    Returns ``(state, weights (M, q), f1 (M, q), q1 (M, q))``.
+    """
+    f1s, q1s = [], []
+    for b in blocks:
+        _b, (F, Q) = b.fwd_filter(yt, return_trace=True)             # F (q, M_b)
+        f1s.append(F)
+        q1s.append(Q)
+    f1 = jnp.asarray(np.concatenate(f1s, axis=1).T)                  # (M, q)
+    q1 = jnp.asarray(np.concatenate(q1s, axis=1).T)
+    if ctx["learn"]:
+        from .ffs.discount_grid import sgd_union_step_q
+        state, w = sgd_union_step_q(state, f1, q1, jnp.asarray(yt), 0.0,
+                                    mi=ctx["mi"], c=ctx["c"],
+                                    dma_prior=ctx["prior"])
+        weights = np.asarray(w)
+    else:
+        state, w = ctx["step"](state,
+                               ForecastBundle(f1[..., None], q1[..., None]),
+                               jnp.asarray(yt))
+        weights = np.asarray(w[:, :, 0])
+    return state, weights, np.asarray(f1), np.asarray(q1)
 
 
 def _multiblock_forecast(blocks, weights, h, level=None, sd_method="quantile"):
@@ -3338,9 +3367,10 @@ class StaticFFS:
     Each datapoint is ingested by the filter exactly once across this
     lifecycle.
 
-    Stateless one-shot:
+    Stateless one-shot (this class only -- ``AutoFFS`` dropped it in 0.2.0,
+    where ``forecast`` came to mean "project the held state" everywhere):
 
-    >>> fc = AutoFFS(season_length=12).forecast(df, h=12, level=[80, 95])
+    >>> fc = StaticFFS(season_length=12).forecast(df, h=12, level=[80, 95])
 
     Diagnostic backtest:
 
@@ -6435,7 +6465,7 @@ class AutoFFS(StaticFFS):
 
     * :meth:`cross_validation` — rolling-origin backtest, what the paper's
       exhibits run.
-    * :meth:`fit` / :meth:`update` / :meth:`predict` — forecast forward, state
+    * :meth:`fit` / :meth:`update` / :meth:`forecast` — forecast forward, state
       held in memory. Equivalent to :class:`AutoFFSUniverse` (asserted bitwise
       in ``tests/test_autoffs_forecast_face.py``); use the universe instead when
       the state must outlive the process, the panel does not fit in memory, or
@@ -6666,10 +6696,18 @@ class AutoFFS(StaticFFS):
                 f"({sorted(lengths)[:5]}...). Use AutoFFSUniverse, which groups "
                 "unequal-length series into batches.")
         arr = np.column_stack([np.asarray(sid_y[s], dtype=float) for s in srs_ids])
+        return self._absorb_initial(
+            arr, srs_ids, {s: sid_ds[s][-1] for s in srs_ids}, freq)
+
+    def _absorb_initial(self, arr, srs_ids, last_ds_map, freq):
+        """Elicit the prior from ``arr`` ``(T, q)`` and hold the resulting carry.
+
+        The body :meth:`fit` runs once the frame has been parsed, factored out so
+        that :meth:`fwd_filter`'s self-initialising path elicits the prior the
+        SAME way rather than by a parallel route.
+        """
         blocks = self._forward_blocks(arr.shape[0])
         if len(blocks) == 1:
-            # single block: its OWN hierarchical combine, byte-identical to the
-            # universe's single-block worker (_grid_fit_batch_file).
             blocks[0].scan_filter(arr)
             self._union_weights = None
         else:
@@ -6678,16 +6716,74 @@ class AutoFFS(StaticFFS):
                 learn_dma=self.learn_dma, dma_prior=self.dma_prior)
             self._union_state, self._union_weights = _st, w
         self._fit_blocks = blocks
-        self._fit_srs_ids = srs_ids
-        self._fit_last_ds = {s: sid_ds[s][-1] for s in srs_ids}
+        self._fit_srs_ids = list(srs_ids)
+        self._fit_last_ds = dict(last_ds_map)
         self._freq = freq
+        self._dma_ctx = None
         return self
+
+    def _warmup_target(self):
+        """Observations to buffer before a prior can be elicited.
+
+        The MAX over the blocks' own warmups. Each block elicits its prior from
+        its own ``ys[:warmup]`` prefix and gates its own discount learning on its
+        own count, so buffering to the longest gives every block the full window
+        it expects — and a block with a shorter warmup simply filters the
+        remaining buffered rows normally, exactly as it would under ``fit`` over
+        the same window.
+        """
+        ws = [int(getattr(b, "warmup")) for b in self._forward_blocks()
+              if getattr(b, "warmup", None) is not None]
+        n = max(ws) if ws else int(self.warmup or self._min_filter_length())
+        return max(n, 1)        # a prior cannot be elicited from nothing
+
+    def _fwd_filter_warming(self, y, return_trace):
+        """Hold observations until there are enough to elicit the prior.
+
+        AutoFFS derives its diffuse prior from data — ``grid_init`` over each
+        block's warmup window — so unlike ``uv_dlm``, which is handed ``m0``/
+        ``C0``, it cannot step from nothing. Rather than require a separate
+        ``fit`` call, the opening observations are buffered and the prior
+        elicited once there are enough. That runs the SAME computation ``fit``
+        would over the same rows (:meth:`_absorb_initial`), so self-initialising
+        and ``fit``-then-step give identical state.
+
+        These steps return NaN. No prior exists yet, so there is no predictive to
+        report, and NaN says exactly that rather than a plausible number.
+        Series are named positionally (``s0``…) and the calendar counts
+        observations from 0, since neither was supplied; pass a frame to
+        :meth:`fit` first if the output needs real ids or dates.
+        """
+        buf = getattr(self, "_warm_buf", None)
+        if buf is None:
+            buf = self._warm_buf = []
+        if buf and y.shape != buf[0].shape:
+            raise ValueError(
+                f"fwd_filter(yt) changed width during warmup: got {y.shape}, "
+                f"previously {buf[0].shape}.")
+        buf.append(y)
+        if len(buf) >= self._warmup_target():
+            arr = np.stack(buf)                                  # (warmup, q)
+            ids = [f"s{j}" for j in range(arr.shape[1])]
+            self._absorb_initial(arr, ids,
+                                 {s: len(buf) - 1 for s in ids}, 1)
+            self._warm_buf = None
+        nan = np.full(y.shape[0], np.nan)
+        bundle = ForecastBundle(nan, nan.copy())
+        # No trace either: the per-worker one-step predictives do not exist
+        # until the workers have a prior.
+        return (bundle, (None, None)) if return_trace else bundle
 
     def update(self, df_new):
         """Advance the held carry over new observations, one filter pass.
 
         Every fitted series must appear, with equal numbers of new rows -- the
         panel advances together.
+
+        This is the SCAN face, matching ``scan_filter`` on the engines: it takes
+        any number of steps and returns ``self``. The one-step-ahead predictive
+        is computed on every step (it drives the DMA weights) but discarded --
+        use :meth:`fwd_filter` for a single step that returns it.
         """
         self._fit_state_check("update")
         per_series, sid_ds, sid_y, _ = self._prepare_input(df_new, self._freq)
@@ -6719,12 +6815,87 @@ class AutoFFS(StaticFFS):
             self._fit_last_ds[s] = sid_ds[s][-1]
         return self
 
-    def predict(self, h, level=None):
-        """``h``-step forecast from the held carry. Does not modify state."""
-        self._fit_state_check("predict")
-        if not isinstance(h, int) or h <= 0:
-            raise ValueError("h must be a positive integer.")
-        level = self._normalise_level(level)
+    def fwd_filter(self, yt, *, return_trace=False):
+        """Advance the filter by one observation for every series.
+
+        The STEP counterpart of :meth:`update`'s scan, carrying the same
+        contract as ``uv_dlm.fwd_filter`` and ``multi_model_dlm.fwd_filter``:
+        advance exactly one observation and return the **one-step-ahead**
+        predictive -- the predictive from the carry as it stood BEFORE ``yt``,
+        which is what ``yt`` is scored against. It is identical to
+        ``predict(1)`` by construction: both go through
+        :meth:`_predictive_arrays`.
+
+        ``update(df_new)`` advances any number of steps and returns ``self``,
+        discarding this quantity even though it is computed on every step (it
+        drives the DMA weights). That is the difference between the two faces.
+
+        Parameters
+        ----------
+        yt : array, shape ``(q,)``
+            One observation per fitted series, in FITTED order
+            (``self._fit_srs_ids``). An array rather than a frame so a per-step
+            loop does not pay the pandas alignment ``update`` does on each call.
+        return_trace : bool, default False
+            Also return the per-worker one-step ``(F, Q)``, each ``(M, q)`` --
+            the quantity CV accumulates as ``f1_full``/``q1_full``, and what the
+            union DMA is driven over.
+
+        Returns
+        -------
+        ForecastBundle
+            One-step-ahead ``loc`` and ``var`` (variance), each ``(q,)``.
+
+        Notes
+        -----
+        The observation consumes one period, so the held calendar advances by
+        one ``freq`` step and :meth:`forecast` continues to date its output from
+        the right origin.
+        """
+        y = np.asarray(yt, dtype=float).ravel()
+        if y.ndim != 1 or y.size == 0:
+            raise ValueError(
+                f"fwd_filter(yt) takes a 1-D observation vector; got shape "
+                f"{np.shape(yt)}.")
+        if self._fit_blocks is None:
+            # No prior yet: buffer until one can be elicited. See
+            # _fwd_filter_warming -- this is why AutoFFS, unlike uv_dlm, cannot
+            # simply step from construction.
+            return self._fwd_filter_warming(y, return_trace)
+        q = len(self._fit_srs_ids)
+        if y.shape != (q,):
+            raise ValueError(
+                f"fwd_filter(yt) takes one observation per fitted series: got "
+                f"shape {np.shape(yt)}, want ({q},). The order is the fitted "
+                f"order; use update(df_new) to match on unique_id instead.")
+        # The one-step-ahead predictive belongs to the carry BEFORE yt.
+        loc, sd, _ = self._predictive_arrays(1, None)
+        bundle = ForecastBundle(loc[:, 0], sd[:, 0] ** 2)
+
+        blocks = self._fit_blocks
+        if self._union_weights is None:
+            _b, (F, Q_) = blocks[0].fwd_filter(y, return_trace=True)
+            f1, q1 = np.asarray(F).T, np.asarray(Q_).T                  # (M, q)
+        else:
+            if getattr(self, "_dma_ctx", None) is None:
+                self._dma_ctx = _multiblock_dma_ctx(
+                    blocks, q, self.dma_pdr, self.dma_mdr,
+                    learn_dma=self.learn_dma, dma_prior=self.dma_prior)
+            (self._union_state, self._union_weights, f1,
+             q1) = _multiblock_step(blocks, self._union_state, y, self._dma_ctx)
+        for sid in self._fit_srs_ids:
+            self._fit_last_ds[sid] = self._future_ds(self._fit_last_ds[sid], 1)[0]
+        return (bundle, (f1, q1)) if return_trace else bundle
+
+    def _predictive_arrays(self, h, level):
+        """``h``-step predictive from the held carry, as arrays.
+
+        The combine shared by :meth:`forecast` (which formats it long) and
+        :meth:`fwd_filter` (which takes it at ``h=1``, before advancing). One
+        implementation, so the one-step face cannot drift from the h-step one.
+
+        Returns ``(loc (q, h), sd (q, h), bounds|None)``.
+        """
         blocks = self._fit_blocks
         if self._union_weights is None:
             # Single block: loc/sd come from the block's OWN combine, which is
@@ -6750,6 +6921,36 @@ class AutoFFS(StaticFFS):
         sd = np.asarray(sd)
         if sd.shape != loc.shape:
             sd = sd.T
+        return loc, sd, bounds
+
+    def forecast(self, h, level=None):
+        """``h``-step forecast from the held carry. Does not modify state.
+
+        ``forecast(h)`` means the same thing at every layer of the library --
+        ``uv_dlm``, ``multi_model_dlm``, the blocks, :class:`AutoFFSUniverse`
+        and here: project what is currently held ``h`` steps ahead. Pair it with
+        :meth:`fwd_filter` (advance one observation) and :meth:`update`
+        (advance many).
+
+        .. versionchanged:: 0.2.0
+           Was ``predict(h)``. The name ``forecast`` previously carried a
+           one-shot ``forecast(df, h)`` fit-and-predict, which has been removed
+           in favour of the explicit ``fit(df).forecast(h)``.
+        """
+        # Checked before the fit-state guard so the migration hint wins over
+        # "call fit first", which is technically true but says nothing useful to
+        # someone running the old one-shot call.
+        if isinstance(h, (pd.DataFrame, pd.Series)):
+            raise TypeError(
+                "AutoFFS.forecast(h) forecasts from the held carry; the one-shot "
+                "forecast(df, h) was removed in 0.2.0, because `forecast` now "
+                "means the same thing on every class in the library. Use "
+                "AutoFFS(...).fit(df).forecast(h=...) instead.")
+        self._fit_state_check("forecast")
+        if not isinstance(h, int) or h <= 0:
+            raise ValueError("h must be a positive integer.")
+        level = self._normalise_level(level)
+        loc, sd, bounds = self._predictive_arrays(h, level)
         rows = []
         for j, sid in enumerate(self._fit_srs_ids):
             fut = self._future_ds(self._fit_last_ds[sid], h)
@@ -6765,36 +6966,21 @@ class AutoFFS(StaticFFS):
                 rows.append(r)
         return pd.DataFrame(rows)
 
-    def forecast(self, df, h, freq=None, level=None):
-        """One-shot fit + predict, discarding the state afterwards.
+    def predict(self, h, level=None):
+        """Deprecated alias of :meth:`forecast`.
 
-        The same signature as the legacy one-shot face, but it runs THIS
-        model -- the wing by default -- rather than the legacy static
-        universe. Inheriting the legacy implementation would silently forecast
-        a different model set than the one the caller constructed.
-
-        ``self`` is left untouched, so a fitted instance can be reused: the
-        work happens on a scratch copy carrying the same configuration. Use
-        :meth:`fit` + :meth:`predict` when the state IS wanted afterwards.
+        .. deprecated:: 0.2.0
+           ``forecast(h)`` is the one route to "project what is held" across the
+           whole library. ``predict`` remains as an alias for the
+           scikit-learn/statsforecast idiom and will be removed in 0.3.0.
         """
-        scratch = AutoFFS(
-            season_length=self.season_length,
-            blocks=self._blocks if not self._wing_default else None,
-            warmup=self.warmup,
-            learn_dma=self.learn_dma,
-            dma_prior=self.dma_prior,
-            var_powers=self.var_powers,
-            n_comps=self.n_comps,
-            grid_period=self.grid_period,
-            n_seas_comps=self.n_seas_comps,
-            dma_pdr=self.dma_pdr,
-            dma_mdr=self.dma_mdr,
-            max_batch_size=self.max_batch_size,
-            dask_client=self.dask_client,
-            alias=self.alias,
-            sd_method=self.sd_method,
-        )
-        return scratch.fit(df, freq=freq).predict(h, level=level)
+        import warnings
+        warnings.warn(
+            "AutoFFS.predict(h) is deprecated since 0.2.0 and will be removed "
+            "in 0.3.0; use forecast(h), which means the same thing here as on "
+            "uv_dlm, multi_model_dlm, the blocks and AutoFFSUniverse.",
+            DeprecationWarning, stacklevel=2)
+        return self.forecast(h, level=level)
 
     def _cv_combine(self, batch_item, arr, level):
         """Combine a batch's block trajectories with the single union DMA.
@@ -7317,7 +7503,12 @@ class AutoFFSUniverse(StaticFFSUniverse):
     def update(self, df_new):
         """Extend the grid universe one (or more) origins. Per affected batch,
         the block carry is loaded, advanced over the new rows (``scan_filter``
-        continues the held carry — resumable exactly), and re-saved."""
+        continues the held carry — resumable exactly), and re-saved.
+
+        The SCAN face: any number of steps, returns ``self``, and persists on
+        every call. :meth:`fwd_filter` is the single-step counterpart, returns
+        the one-step-ahead predictive, and can defer the write via
+        ``persist=False`` + :meth:`flush`."""
         self._check_exog_supported()
         if not self._grid_mode:
             return super().update(df_new)
@@ -7377,6 +7568,155 @@ class AutoFFSUniverse(StaticFFSUniverse):
             for sid, lds in mset.items():
                 self._manifest.loc[sid, "last_ds"] = lds
         self._save_manifest()
+        return self
+
+    def _step_entry(self, bid, cfg):
+        """Load one batch's carry for stepping, with its slot lookup."""
+        path = self._batch_path(bid)
+        srs_ids, active_arr, last_ds = _load_batch_meta(path)
+        if self._multiblock:
+            blocks, state, weights, _cap = _load_multiblock_batch(path, cfg)
+            ctx = _multiblock_dma_ctx(
+                blocks, len(srs_ids), cfg[1], cfg[2],
+                learn_dma=bool(cfg[4]) if len(cfg) > 4 else False,
+                dma_prior=cfg[5] if len(cfg) > 5 else None)
+        else:
+            b = _grid_block_from_cfg(cfg)
+            b.load(path)
+            blocks, state, weights, ctx = [b], None, None, None
+        return {"path": path, "srs_ids": list(srs_ids),
+                "active": np.asarray(active_arr, dtype=bool),
+                "last_ds": dict(last_ds), "blocks": blocks, "state": state,
+                "weights": weights, "ctx": ctx, "dirty": False,
+                "slot": {s: i for i, s in enumerate(srs_ids)}}
+
+    def fwd_filter(self, yt, *, persist=True, return_trace=False):
+        """Advance every active series by one observation.
+
+        The STEP counterpart of :meth:`update`'s scan, with the same contract as
+        :meth:`AutoFFS.fwd_filter` and ``uv_dlm.fwd_filter``: advance exactly one
+        observation and return the **one-step-ahead** predictive -- the
+        predictive from the carry as it stood BEFORE ``yt``, which is what
+        ``yt`` is scored against.
+
+        Parameters
+        ----------
+        yt : array, shape ``(n_active,)``
+            One observation per ACTIVE series, in manifest order.
+        persist : bool, default True
+            Write each touched batch back, exactly as :meth:`update` does.
+            Persisting is what makes ``update`` crash-safe and it is not cheap --
+            an M5-sized batch runs to hundreds of MB, so a per-step save can cost
+            seconds against a filter step of milliseconds. ``persist=False``
+            keeps the advanced carries in memory for the next call and defers the
+            write to :meth:`flush`; that is the mode for a per-step loop.
+
+            It is also how you DRY-RUN a universe: step it forward, read the
+            predictives, and walk away without :meth:`flush` -- the persisted
+            carry is untouched, so the run leaves no trace. Discarding is the
+            feature, not a hazard; ``flush()`` is what makes a run count.
+        return_trace : bool, default False
+            Also return the per-worker one-step ``(F, Q)`` as
+            ``{batch_id: (F, Q)}``. Batches may carry different worker counts,
+            so these do not stack into one array.
+
+        Returns
+        -------
+        ForecastBundle
+            One-step-ahead ``loc`` and ``var``, each ``(n_active,)``, in
+            manifest order.
+        """
+        self._check_exog_supported()
+        if not self._grid_mode:
+            raise NotImplementedError(
+                "fwd_filter is grid-mode only. A legacy universe "
+                "(grid_period=None) advances through update(df_new).")
+        ids = list(self._manifest[self._manifest["active"]].index)
+        y = np.asarray(yt, dtype=float).ravel()
+        if y.shape != (len(ids),):
+            raise ValueError(
+                f"fwd_filter(yt) takes one observation per ACTIVE series: got "
+                f"shape {np.shape(yt)}, want ({len(ids)},), in manifest order.")
+        yby = dict(zip(ids, y))
+        pos = {sid: i for i, sid in enumerate(ids)}
+        if getattr(self, "_step_cache", None) is None:
+            self._step_cache = {}
+        cfg = self._grid_cfg()
+
+        by_batch: dict = {}
+        for sid in ids:
+            by_batch.setdefault(int(self._manifest.loc[sid, "batch_id"]),
+                                []).append(sid)
+
+        loc_out = np.empty(len(ids)); var_out = np.empty(len(ids)); traces = {}
+        for bid, sids_b in by_batch.items():
+            ent = self._step_cache.get(bid)
+            if ent is None:
+                ent = self._step_entry(bid, cfg)
+                self._step_cache[bid] = ent
+            # The one-step-ahead predictive belongs to the carry BEFORE yt, so
+            # it is read off first -- the same quantity forecast(1) reports.
+            if ent["state"] is None:
+                l1, s1, _c = ent["blocks"][0].forecast(1)
+            else:
+                l1, s1, _b = _multiblock_forecast(ent["blocks"], ent["weights"], 1)
+            l1 = np.asarray(l1); s1 = np.asarray(s1)
+            if s1.shape != l1.shape:
+                s1 = s1.T
+            for s in sids_b:
+                j = ent["slot"][s]
+                loc_out[pos[s]] = float(l1[j, 0])
+                var_out[pos[s]] = float(s1[j, 0]) ** 2
+            # Grid batches are all-active, so every slot is a real series; an
+            # inactive slot would keep its own last value rather than move.
+            row = np.array([yby.get(s, 0.0) for s in ent["srs_ids"]], dtype=float)
+            if ent["state"] is None:
+                _b, (F, Qq) = ent["blocks"][0].fwd_filter(row, return_trace=True)
+                F, Qq = np.asarray(F).T, np.asarray(Qq).T
+            else:
+                (ent["state"], ent["weights"], F,
+                 Qq) = _multiblock_step(ent["blocks"], ent["state"], row,
+                                        ent["ctx"])
+            traces[bid] = (F, Qq)
+            for s in sids_b:
+                ent["last_ds"][s] = self._future_ds(ent["last_ds"][s], 1)[0]
+            ent["dirty"] = True
+
+        if persist:
+            self.flush()
+        bundle = ForecastBundle(loc_out, var_out)
+        return (bundle, traces) if return_trace else bundle
+
+    def flush(self):
+        """Persist carries advanced under ``fwd_filter(persist=False)``.
+
+        A no-op when nothing is pending, so it is safe to call unconditionally
+        at the end of a stepping loop.
+        """
+        cache = getattr(self, "_step_cache", None)
+        if not cache:
+            return self
+        touched = False
+        for _bid, ent in list(cache.items()):
+            if not ent["dirty"]:
+                continue
+            arr, is_int = self._last_ds_arr(ent["srs_ids"], ent["last_ds"])
+            if self._multiblock:
+                _save_multiblock_batch_file(
+                    ent["blocks"], ent["state"], ent["weights"], ent["path"],
+                    ent["srs_ids"], ent["active"], arr, is_int)
+            else:
+                _save_grid_batch_file(ent["blocks"][0], ent["path"],
+                                      ent["srs_ids"], ent["active"], arr, is_int)
+            for s, a in zip(ent["srs_ids"], ent["active"]):
+                if a:
+                    self._manifest.loc[s, "last_ds"] = ent["last_ds"][s]
+            touched = True
+        # Dropped wholesale: the next step reloads from what was just written,
+        # so a stale carry cannot outlive its file.
+        self._step_cache = {}
+        if touched:
+            self._save_manifest()
         return self
 
     def forecast(self, h, level=None, return_components: bool = False):

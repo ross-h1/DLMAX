@@ -78,7 +78,7 @@ Load the bundled airline-passengers series and forecast 24 months ahead:
 from DLMAX import AutoFFS, load_dataset
 
 df = load_dataset("airline_passengers")          # 144 monthly obs, long format
-forecast = AutoFFS(season_length=12).forecast(df, h=24, level=[80, 95])
+forecast = AutoFFS(season_length=12).fit(df).forecast(h=24, level=[80, 95])
 forecast.head()
 ```
 

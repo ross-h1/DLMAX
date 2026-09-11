@@ -1545,7 +1545,8 @@ class multi_model_dlm(object):
             return mon.reshape(-1)
         return None
 
-    def fwd_filter(self, yt, regressors=None, Gt=None, monitor=True):
+    def fwd_filter(self, yt, regressors=None, Gt=None, monitor=True,
+                   warmup_flag=0.0):
         """Advance the whole universe by one observation.
 
         Single forward-filtering step over the packed ``(n_models * n_series)``
@@ -1563,6 +1564,14 @@ class multi_model_dlm(object):
             broadcast across models. ``None`` runs the structural path.
         Gt : optional
             Reserved; not currently applied.
+        warmup_flag : scalar 0.0/1.0, default 0.0
+            Treat this step as part of the warmup window: the discount matrix is
+            zeroed (no variance inflation) and the observational variance
+            estimate is held. The scan path has always applied this per step
+            (``warmup_flag_t`` in its carry); exposing it here lets a caller
+            driving the filter ONE STEP AT A TIME reproduce the scan over the
+            same window, which it could not before. Default 0.0 leaves every
+            existing caller bit-identical.
         monitor : bool, default True
             Enable the signed-error monitor's adaptive-discount intervention
             *if the universe is adaptive* (i.e. carries a positive tau in its
@@ -1615,6 +1624,7 @@ class multi_model_dlm(object):
             device_put(
                 pad(yt, self.npad) * jnp.ones((self.nm, 1)), self.dlm_compute
             ).reshape(self.p),
+            warmup_flag,
             regressors=reg_t,
             reg_mask=getattr(self, "reg_mask", None),
             tau=self._monitor_tau(monitor),
@@ -2584,7 +2594,20 @@ def dlm_uv_fcast_H(disc_factor, variance_disc, var_power, mc, Stm1, DH):
     d = s * Stm1["nu"] * variance_disc
     nu = variance_disc * Stm1["nu"]
     s = d / nu
-    q = s + axis0dot(axis0dot(F, RH), F)
+    # q = s + F'RH F. The state term is a quadratic form in a covariance, so it
+    # is non-negative for any PSD RH; a negative value means RH lost positive
+    # definiteness to rounding. That happens when the filter runs near marginal
+    # stability -- a high discount floor over a long horizon leaves RH large and
+    # ill-conditioned -- and it surfaced as `invalid value encountered in sqrt`
+    # downstream in the Vincent SD combine, where the component then went NaN,
+    # was dropped, and silently cost that worker its DMA weight for the cell.
+    #
+    # Clamping the TERM rather than q keeps the floor principled: the predictive
+    # can never be tighter than the observation variance s, so q >= s > 0. It is
+    # a no-op wherever the arithmetic is sound (M4/M5 never trigger it), and
+    # NaN/inf pass through jnp.maximum unchanged, so a genuinely diverged
+    # component still reports non-finite rather than being quietly rescued.
+    q = s + jnp.maximum(axis0dot(axis0dot(F, RH), F), 0.0)
     return {
         "m": aH,
         "C": RH,

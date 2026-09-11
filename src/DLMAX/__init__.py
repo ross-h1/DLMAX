@@ -13,18 +13,21 @@ Quick start
 -----------
 ``df_history`` is long format — columns ``(unique_id, ds, y)``::
 
-    >>> from DLMAX import AutoFFS
+    >>> from DLMAX import AutoFFS, load_dataset
+    >>> df_history = load_dataset("airline_passengers")
     >>> model = AutoFFS(season_length=12).fit(df_history)
-    >>> forecast = model.predict(h=12, level=[80, 95])
+    >>> forecast = model.forecast(h=12, level=[80, 95])
+    >>> list(forecast.columns)[:4]
+    ['unique_id', 'ds', 'AutoFFS', 'AutoFFS-sd']
 
-``predict`` returns one row per ``(unique_id, ds)`` with the point forecast,
+``forecast`` returns one row per ``(unique_id, ds)`` with the point forecast,
 its predictive SD, and the requested interval bounds. To extend the model as
 data arrives, ``model.update(df_new)`` costs one filter pass over the new rows
 — no refit.
 
 Three entry points, by what you need to hold:
 
-* :class:`AutoFFS` — fit / update / predict with the state in memory, plus
+* :class:`AutoFFS` — fit / update / forecast with the state in memory, plus
   :meth:`~AutoFFS.cross_validation` for rolling-origin backtests. Start here.
 * :class:`AutoFFSUniverse` — the same model with state on disk, for panels that
   outlive the process or do not fit in memory, and for series that arrive later

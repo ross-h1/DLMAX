@@ -45,16 +45,16 @@ def _universe(tmp_path, df, name="u"):
 # --------------------------------------------------------------------------
 def test_fit_predict_runs():
     df = _panel()
-    out = AutoFFS(season_length=SEASON, warmup=SEASON).fit(df).predict(h=H)
+    out = AutoFFS(season_length=SEASON, warmup=SEASON).fit(df).forecast(h=H)
     assert len(out) == 3 * H
     assert set(out.columns) >= {"unique_id", "ds", "AutoFFS", "AutoFFS-sd"}
     assert np.isfinite(out["AutoFFS"]).all()
     assert (out["AutoFFS-sd"] > 0).all()
 
 
-def test_predict_levels_are_ordered_and_nested():
+def test_forecast_levels_are_ordered_and_nested():
     df = _panel()
-    out = AutoFFS(season_length=SEASON, warmup=SEASON).fit(df).predict(
+    out = AutoFFS(season_length=SEASON, warmup=SEASON).fit(df).forecast(
         h=H, level=[80, 95])
     assert (out["AutoFFS-lo-95"] <= out["AutoFFS-lo-80"]).all()
     assert (out["AutoFFS-hi-80"] <= out["AutoFFS-hi-95"]).all()
@@ -62,33 +62,33 @@ def test_predict_levels_are_ordered_and_nested():
     assert (out["AutoFFS"] <= out["AutoFFS-hi-80"]).all()
 
 
-def test_forecast_is_the_one_shot_form():
-    """``forecast(df, h)`` is fit + predict in one call, discarding the state.
+def test_one_shot_forecast_is_gone_with_a_migration_hint():
+    """``forecast(df, h)`` was removed in 0.2.0; the error must say what to do.
 
-    NOT an alias of ``predict``: it takes the data, because the whole point is
-    that nothing is held afterwards. It must also run THIS model -- inheriting
-    the legacy one-shot implementation would forecast the static universe while
-    the caller constructed a wing.
+    ``forecast`` now means "project what is held" on every class in the library
+    (uv_dlm, multi_model_dlm, the blocks, AutoFFS, AutoFFSUniverse), so the name
+    could not also carry a one-shot fit-and-predict.
     """
     df = _panel()
-    one_shot = AutoFFS(season_length=SEASON, warmup=SEASON).forecast(df, h=H)
-    staged = AutoFFS(season_length=SEASON, warmup=SEASON).fit(df).predict(h=H)
-    np.testing.assert_allclose(one_shot["AutoFFS"].to_numpy(),
-                               staged["AutoFFS"].to_numpy(), rtol=0, atol=0)
-
-
-def test_forecast_leaves_the_instance_unfitted():
-    """The one-shot form works on a scratch copy, so a fitted model is reusable."""
-    df = _panel()
     m = AutoFFS(season_length=SEASON, warmup=SEASON)
-    m.forecast(df, h=H)
-    assert m.is_fitted is False
+    with pytest.raises(TypeError, match=r"fit\(df\)\.forecast"):
+        m.forecast(df)
 
 
-def test_predict_does_not_move_the_state():
+def test_predict_is_a_deprecated_alias_of_forecast():
+    """``predict`` still works, warns, and returns exactly what forecast does."""
     df = _panel()
     m = AutoFFS(season_length=SEASON, warmup=SEASON).fit(df)
-    first, second = m.predict(h=H), m.predict(h=H)
+    want = m.forecast(h=H)
+    with pytest.warns(DeprecationWarning, match="use forecast"):
+        got = m.predict(h=H)
+    pd.testing.assert_frame_equal(got, want)
+
+
+def test_forecast_does_not_move_the_state():
+    df = _panel()
+    m = AutoFFS(season_length=SEASON, warmup=SEASON).fit(df)
+    first, second = m.forecast(h=H), m.forecast(h=H)
     pd.testing.assert_frame_equal(first, second)
 
 
@@ -97,7 +97,7 @@ def test_predict_does_not_move_the_state():
 # --------------------------------------------------------------------------
 def test_fit_predict_matches_universe_bitwise(tmp_path):
     df = _panel()
-    mem = AutoFFS(season_length=SEASON, warmup=SEASON).fit(df).predict(h=H)
+    mem = AutoFFS(season_length=SEASON, warmup=SEASON).fit(df).forecast(h=H)
     dsk = _universe(tmp_path, df).forecast(h=H)
     key = ["unique_id", "ds"]
     a = mem.sort_values(key).reset_index(drop=True)
@@ -119,7 +119,7 @@ def test_update_then_predict_matches_universe_bitwise(tmp_path):
     dsk = _universe(tmp_path, hist)
     dsk.update(new)
 
-    a = mem.predict(h=H).sort_values(["unique_id", "ds"]).reset_index(drop=True)
+    a = mem.forecast(h=H).sort_values(["unique_id", "ds"]).reset_index(drop=True)
     b = dsk.forecast(h=H).sort_values(["unique_id", "ds"]).reset_index(drop=True)
     assert list(a["ds"]) == list(b["ds"])          # calendar advanced together
     for col in ("AutoFFS", "AutoFFS-sd"):
@@ -133,9 +133,9 @@ def test_update_is_equivalent_to_fitting_the_whole_history(tmp_path):
     full = _panel(t=T + 4)
     hist = full.groupby("unique_id", group_keys=False).head(T)
     new = full.groupby("unique_id", group_keys=False).tail(4)
-    one = AutoFFS(season_length=SEASON, warmup=SEASON).fit(full).predict(h=H)
+    one = AutoFFS(season_length=SEASON, warmup=SEASON).fit(full).forecast(h=H)
     two = (AutoFFS(season_length=SEASON, warmup=SEASON)
-           .fit(hist).update(new).predict(h=H))
+           .fit(hist).update(new).forecast(h=H))
     np.testing.assert_allclose(one["AutoFFS"].to_numpy(),
                                two["AutoFFS"].to_numpy(), rtol=0, atol=0)
 
@@ -145,7 +145,7 @@ def test_update_is_equivalent_to_fitting_the_whole_history(tmp_path):
 # --------------------------------------------------------------------------
 def test_predict_before_fit_raises():
     with pytest.raises(RuntimeError, match="Call fit"):
-        AutoFFS(season_length=SEASON).predict(h=H)
+        AutoFFS(season_length=SEASON).forecast(h=H)
 
 
 def test_update_before_fit_raises():
@@ -180,4 +180,4 @@ def test_bad_h_raises():
     m = AutoFFS(season_length=SEASON, warmup=SEASON).fit(_panel())
     for bad in (0, -1, 2.5):
         with pytest.raises(ValueError, match="positive integer"):
-            m.predict(h=bad)
+            m.forecast(h=bad)

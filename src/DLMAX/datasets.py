@@ -12,7 +12,7 @@ through:
 >>> df = load_dataset("airline_passengers")
 >>> df.shape
 (144, 3)
->>> fc = AutoFFS(season_length=12).forecast(df, h=12)   # doctest: +SKIP
+>>> fc = AutoFFS(season_length=12).fit(df).forecast(h=12)   # doctest: +SKIP
 """
 
 from importlib.resources import files

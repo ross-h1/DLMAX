@@ -63,11 +63,25 @@ def test_canonical_cv_null_diff_with_levels():
     _assert_cv_identical(h=4, n_windows=2, freq=1, level=[80, 95], _seed=1)
 
 
-def test_production_methods_stubbed():
-    sb = StaticBlock(season_length=12, n_seas_comps=2)
-    for name in ("scan_filter", "fwd_filter", "forecast"):
-        with pytest.raises(NotImplementedError):
-            getattr(sb, name)(None)
+def test_streaming_is_implemented_persistence_is_not():
+    """``scan_filter``/``fwd_filter``/``forecast`` stream; save/load do not.
+
+    These three used to raise: the block was the CV seam, and streaming a static
+    universe lived only behind ``AutoFFSUniverse(grid_period=None)``. They now
+    work, so ``AutoFFS(blocks=[StaticBlock(...)])`` is usable — see
+    ``tests/test_static_block_streaming.py``. Persistence stays unimplemented on
+    purpose: a PERSISTENT static universe is still the universe's legacy path.
+    """
+    sb = StaticBlock(season_length=12, n_seas_comps=2, warmup=12, h_template=4)
+    rng = np.random.default_rng(0)
+    arr = 100 + np.arange(30)[:, None] * 0.3 + rng.normal(0, 1.0, (30, 2))
+    sb.scan_filter(arr)                       # must not raise
+    sb.fwd_filter(arr[-1])
+    loc, _sd, _comp = sb.forecast(2)
+    assert np.isfinite(np.asarray(loc)).all()
+    for name in ("save", "load"):
+        with pytest.raises(NotImplementedError, match="grid_period=None"):
+            getattr(sb, name)("ignored.h5")
 
 
 def test_canonical_cv_grid_mode_runs_and_differs():
