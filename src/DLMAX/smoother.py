@@ -183,6 +183,15 @@ def _validate(model, *, sampling, allow_approximate):
         reasons.append("enable_adapt (RTRL discount learning) is active")
     if getattr(model, "_wing", None) is not None:
         reasons.append("enable_wing is active")
+    if int(getattr(model, "warmup_steps", 0) or 0) > 0:
+        reasons.append(
+            f"warmup_steps={int(model.warmup_steps)}: W was forced to 0 over the "
+            "opening steps, so the applied discount is NOT constant in t. "
+            "`applied_disc` is a single (p,) vector broadcast over every step, so "
+            "the backward recursion reconstructs R_t with forgetting inflation "
+            "those steps never had. Exact only from step warmup_steps on; pass a "
+            "trajectory that starts after the window, or accept the approximation"
+        )
 
     approximate = bool(reasons)
     if approximate and sampling and not allow_approximate:

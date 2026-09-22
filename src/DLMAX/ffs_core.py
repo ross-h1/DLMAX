@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
-import tqdm
 from jax import config, device_put, devices, make_mesh
 from jax.tree_util import Partial
 from jax.scipy.linalg import block_diag
@@ -803,7 +802,7 @@ def calc_srs(
         new_dlm_state["nu"] = new_dlm_state["nu"].squeeze()
         return (new_dlm_state, new_alloc_state), (weights, model)
 
-    # for t in tqdm.trange(T):
+    # for t in range(T):
     # filter all models for this timestep
     #    y = jnp.asarray(fit_data.iloc[t].values)
     #    f, q = multi.fwd_filter(y)
@@ -923,11 +922,14 @@ def calc_srs_orig(
         n_models=k, n_series=n, n_classes=nmset, model_indicator=model_indicator.values
     )
 
-    for t in tqdm.trange(T):
+    for t in range(T):
         # filter all models for this timestep
 
         y = jnp.asarray(fit_data.iloc[t].values)
-        f, q = multi.fwd_filter(y)
+        # Explicit 0.0 rather than the self-counting default: this legacy
+        # reference loop builds its universe without warmup_steps, so the two
+        # agree, and saying so keeps it that way if the assembly ever changes.
+        f, q = multi.fwd_filter(y, warmup_flag=0.0)
 
         model_set_loc = model_set_loc.at[:, t, idx].set(
             device_put(f.T, device=devices.allocation_compute)
@@ -6438,6 +6440,90 @@ def _wide_to_long(df):
     )
 
 
+def _step_obs(yt):
+    """Normalise one step's observation to ``(y (q,), ids | None, ds | None)``.
+
+    The STEP analogue of :func:`_wide_to_long`: ``fwd_filter`` takes a single
+    row, and a labelled row already carries everything the positional array
+    form has to be told separately. ``df.iloc[t]`` is a Series indexed by the
+    series ids and NAMED by the timestamp, so a caller stepping through a frame
+    gets identification and calendar for free.
+
+    A plain array returns ``(y, None, None)`` and travels exactly the path it
+    always did -- the pandas alignment is paid only by callers who ask for it.
+    A one-row DataFrame (``df.iloc[[t]]``) is squeezed to its row, since that is
+    the other natural spelling of "the observation at t".
+    """
+    if isinstance(yt, pd.DataFrame):
+        if len(yt) != 1:
+            raise ValueError(
+                f"fwd_filter(yt) takes ONE observation; got a DataFrame with "
+                f"{len(yt)} rows. Use update(df_new) to advance several steps.")
+        yt = yt.iloc[0]
+    if isinstance(yt, pd.Series):
+        return yt.to_numpy(dtype=float), list(yt.index), yt.name
+    return np.asarray(yt, dtype=float).ravel(), None, None
+
+
+def _infer_step_freq(stamps):
+    """The frequency of a buffered run of step timestamps, or ``None``.
+
+    ``fit`` infers freq from the frame it is handed; a stepped stream has to
+    accumulate the same evidence one ``yt.name`` at a time. Integer stamps give
+    the spacing directly. Datetime stamps go through ``pd.infer_freq``, which
+    needs THREE points -- a single gap does not identify a calendar frequency
+    (91 days is 'QS-DEC' or 'QE' or nothing). Below that, returning None keeps
+    today's integer calendar rather than guessing a calendar wrong: the ids are
+    fixed either way, and a silently wrong date is worse than an honest count.
+    """
+    if len(stamps) < 2:
+        return None
+    if all(isinstance(t, (int, np.integer)) for t in stamps):
+        diffs = np.diff(np.asarray(stamps, dtype=np.int64))
+        return int(diffs[0]) if np.all(diffs == diffs[0]) else None
+    try:
+        idx = pd.DatetimeIndex(pd.to_datetime(list(stamps)))
+    except (TypeError, ValueError):
+        return None
+    if len(idx) < 3:
+        return None
+    try:
+        return pd.infer_freq(idx)
+    except (TypeError, ValueError):
+        return None
+
+
+def _align_step(y, ids, srs_ids, what="fitted"):
+    """Reorder a labelled observation onto ``srs_ids``, both-ways checked.
+
+    The same two-sided contract ``update(df_new)`` enforces -- every known
+    series must appear and no unknown one may -- applied to a single step. An
+    unlabelled ``y`` cannot be checked this way and is returned untouched, to
+    be width-checked positionally by the caller as before.
+    """
+    if ids is None:
+        return y
+    known, provided = list(srs_ids), set(ids)
+    if len(provided) != len(ids):
+        dupes = sorted({i for i in ids if list(ids).count(i) > 1})
+        raise ValueError(
+            f"fwd_filter(yt) has duplicate series ids: {dupes[:5]}.")
+    missing = [s for s in known if s not in provided]
+    if missing:
+        raise ValueError(
+            f"fwd_filter(yt) is missing {what} series {missing[:5]} "
+            f"({len(missing)} of {len(known)}): the panel advances together. "
+            f"Pass NaN for a series with no observation this period.")
+    extra = sorted(provided - set(known))
+    if extra:
+        raise ValueError(
+            f"fwd_filter(yt) carries series that are not {what}: {extra[:5]} "
+            f"({len(extra)} of {len(ids)}). A step advances the panel it has; "
+            f"it does not extend it.")
+    pos = {sid: i for i, sid in enumerate(ids)}
+    return y[[pos[s] for s in known]]
+
+
 class AutoFFS(StaticFFS):
     """Block-based AutoFFS — **the wing grid by default**.
 
@@ -6737,7 +6823,7 @@ class AutoFFS(StaticFFS):
         n = max(ws) if ws else int(self.warmup or self._min_filter_length())
         return max(n, 1)        # a prior cannot be elicited from nothing
 
-    def _fwd_filter_warming(self, y, return_trace):
+    def _fwd_filter_warming(self, y, return_trace, ids=None, ds=None):
         """Hold observations until there are enough to elicit the prior.
 
         AutoFFS derives its diffuse prior from data — ``grid_init`` over each
@@ -6750,24 +6836,44 @@ class AutoFFS(StaticFFS):
 
         These steps return NaN. No prior exists yet, so there is no predictive to
         report, and NaN says exactly that rather than a plausible number.
-        Series are named positionally (``s0``…) and the calendar counts
-        observations from 0, since neither was supplied; pass a frame to
-        :meth:`fit` first if the output needs real ids or dates.
+
+        ``ids``/``ds`` come from a LABELLED ``yt`` (see :func:`_step_obs`) and
+        name the panel the way ``fit`` would. Without them the series are named
+        positionally (``s0``…) and the calendar counts observations from 0,
+        since neither was supplied — step the frame (``df.iloc[t]``) or call
+        :meth:`fit` first if the output needs real ids or dates. This matters
+        for a ragged panel, where ``fit`` is not available at all: it requires
+        one shared calendar and every series to have an observation in the
+        window, which a warmup-length slice of a ragged frame does not give.
         """
         buf = getattr(self, "_warm_buf", None)
         if buf is None:
             buf = self._warm_buf = []
+            self._warm_ids, self._warm_ds = ids, []
         if buf and y.shape != buf[0].shape:
             raise ValueError(
                 f"fwd_filter(yt) changed width during warmup: got {y.shape}, "
                 f"previously {buf[0].shape}.")
+        # Labelled input is checked by LABEL, not merely by width: a reordered
+        # or substituted column is the failure the positional form cannot see.
+        if ids is not None and self._warm_ids is not None:
+            y = _align_step(y, ids, self._warm_ids, what="buffered")
         buf.append(y)
+        self._warm_ds.append(ds)
         if len(buf) >= self._warmup_target():
             arr = np.stack(buf)                                  # (warmup, q)
-            ids = [f"s{j}" for j in range(arr.shape[1])]
-            self._absorb_initial(arr, ids,
-                                 {s: len(buf) - 1 for s in ids}, 1)
-            self._warm_buf = None
+            ids_out = self._warm_ids
+            if ids_out is None:
+                ids_out = [f"s{j}" for j in range(arr.shape[1])]
+            last_ds, freq = len(buf) - 1, 1
+            stamps = [t for t in self._warm_ds if t is not None]
+            if len(stamps) == len(buf):
+                inferred = _infer_step_freq(stamps)
+                if inferred is not None:
+                    last_ds, freq = stamps[-1], inferred
+            self._absorb_initial(arr, ids_out,
+                                 {s: last_ds for s in ids_out}, freq)
+            self._warm_buf = self._warm_ids = self._warm_ds = None
         nan = np.full(y.shape[0], np.nan)
         bundle = ForecastBundle(nan, nan.copy())
         # No trace either: the per-worker one-step predictives do not exist
@@ -6832,10 +6938,20 @@ class AutoFFS(StaticFFS):
 
         Parameters
         ----------
-        yt : array, shape ``(q,)``
-            One observation per fitted series, in FITTED order
-            (``self._fit_srs_ids``). An array rather than a frame so a per-step
-            loop does not pay the pandas alignment ``update`` does on each call.
+        yt : array ``(q,)``, or Series indexed by series id
+            One observation per fitted series. An ARRAY is taken in FITTED order
+            (``self._fit_srs_ids``) and costs no alignment, which is why it is
+            the fast path for a per-step loop. A **Series** is matched on its
+            index instead -- every fitted series must appear and no unfitted one
+            may, the two-sided contract ``update(df_new)`` enforces -- so column
+            order cannot silently mis-assign. ``df.iloc[t]`` is exactly that
+            Series, and its ``name`` dates the step; a one-row DataFrame
+            (``df.iloc[[t]]``) is accepted as the same thing.
+
+            Before a prior exists the labels do more: they name the panel and
+            set the calendar for the whole run, which is otherwise ``s0``… and
+            an integer count. That is the only route for a ragged panel, where
+            :meth:`fit` cannot be called at all.
         return_trace : bool, default False
             Also return the per-worker one-step ``(F, Q)``, each ``(M, q)`` --
             the quantity CV accumulates as ``f1_full``/``q1_full``, and what the
@@ -6852,7 +6968,7 @@ class AutoFFS(StaticFFS):
         one ``freq`` step and :meth:`forecast` continues to date its output from
         the right origin.
         """
-        y = np.asarray(yt, dtype=float).ravel()
+        y, ids, ds = _step_obs(yt)
         if y.ndim != 1 or y.size == 0:
             raise ValueError(
                 f"fwd_filter(yt) takes a 1-D observation vector; got shape "
@@ -6861,13 +6977,15 @@ class AutoFFS(StaticFFS):
             # No prior yet: buffer until one can be elicited. See
             # _fwd_filter_warming -- this is why AutoFFS, unlike uv_dlm, cannot
             # simply step from construction.
-            return self._fwd_filter_warming(y, return_trace)
+            return self._fwd_filter_warming(y, return_trace, ids, ds)
         q = len(self._fit_srs_ids)
+        y = _align_step(y, ids, self._fit_srs_ids)
         if y.shape != (q,):
             raise ValueError(
                 f"fwd_filter(yt) takes one observation per fitted series: got "
                 f"shape {np.shape(yt)}, want ({q},). The order is the fitted "
-                f"order; use update(df_new) to match on unique_id instead.")
+                f"order; pass a Series keyed by unique_id, or use "
+                f"update(df_new), to match on id instead.")
         # The one-step-ahead predictive belongs to the carry BEFORE yt.
         loc, sd, _ = self._predictive_arrays(1, None)
         bundle = ForecastBundle(loc[:, 0], sd[:, 0] ** 2)
@@ -7601,8 +7719,11 @@ class AutoFFSUniverse(StaticFFSUniverse):
 
         Parameters
         ----------
-        yt : array, shape ``(n_active,)``
-            One observation per ACTIVE series, in manifest order.
+        yt : array ``(n_active,)``, or Series indexed by series id
+            One observation per ACTIVE series. An ARRAY is taken in manifest
+            order; a **Series** is matched on its index instead, so a reordered
+            manifest cannot silently mis-assign observations. A one-row
+            DataFrame (``df.iloc[[t]]``) is accepted as the same thing.
         persist : bool, default True
             Write each touched batch back, exactly as :meth:`update` does.
             Persisting is what makes ``update`` crash-safe and it is not cheap --
@@ -7632,11 +7753,13 @@ class AutoFFSUniverse(StaticFFSUniverse):
                 "fwd_filter is grid-mode only. A legacy universe "
                 "(grid_period=None) advances through update(df_new).")
         ids = list(self._manifest[self._manifest["active"]].index)
-        y = np.asarray(yt, dtype=float).ravel()
+        y, y_ids, _ds = _step_obs(yt)
+        y = _align_step(y, y_ids, ids, what="active")
         if y.shape != (len(ids),):
             raise ValueError(
                 f"fwd_filter(yt) takes one observation per ACTIVE series: got "
-                f"shape {np.shape(yt)}, want ({len(ids)},), in manifest order.")
+                f"shape {np.shape(yt)}, want ({len(ids)},), in manifest order. "
+                f"Pass a Series keyed by unique_id to match on id instead.")
         yby = dict(zip(ids, y))
         pos = {sid: i for i, sid in enumerate(ids)}
         if getattr(self, "_step_cache", None) is None:

@@ -8,7 +8,7 @@ name = "awen-dlmax"
 # PyPI rejects "dlmax" as confusable with the existing "dimax" (l/i/1 are
 # treated as interchangeable to block typosquatting), and `awen-` claims a
 # namespace rather than competing for a generic one.
-version = "0.2.0"
+version = "0.3.0"
 description = "Dynamic Linear Models in JAX"
 authors = [{name = "Ross Hollyman", email = "hello@awenforecasting.com"}]
 # A project role address, not a personal one: `author_email` is PUBLIC and

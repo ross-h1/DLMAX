@@ -44,6 +44,13 @@ from DLMAX.ffs_core import initial_state
 MONITOR_INJECT_LT = 0.5
 MONITOR_INJECT_SEAS = 0.8
 
+#: Warmup window for a discount LEARNER (Adapt/Wing) compiled without an
+#: explicit ``warmup_steps``. A learner needs some settled history before its
+#: gradient means anything, so it defaults to a window where a fixed-discount
+#: model defaults to none. Published behaviour since the RTRL overlays landed;
+#: it lives here so ONE number reaches both the model and its overlay.
+DEFAULT_LEARNER_WARMUP = 6
+
 
 @dataclass(frozen=True)
 class Adapt:
@@ -1581,8 +1588,12 @@ class DLM:
         device : NamedSharding, optional
             Defaults to ``DLMAX.ffs.devices.host_device``.
         warmup_steps : int, optional
-            number of steps to keep discount rate = 1 for mximum learning
-            of initial state
+            Number of opening steps to hold the discount at 1 (so ``W = 0``,
+            no forgetting inflation) while the initial state is learned. It
+            does TWO things, which is worth knowing: a positive value also
+            selects the diffuse prior over the legacy OLS elicitation (see
+            ``design``), and ``None`` and ``0`` are equivalent for that choice.
+            The value is stored on the returned model as ``warmup_steps``.
         h : int, optional
             Forecast horizon. If set, ``GH`` is precomputed for the
             returned ``uv_dlm``, enabling efficient ``forecast(h)``.
@@ -1634,7 +1645,6 @@ class DLM:
             monitor=monitor,
         )
 
-        result.warmup_steps = warmup_steps if warmup_steps is not None else 0
         # Mark the regression tail's kind so the streaming driver picks the right
         # filter/forecast path. A model is autoregressive iff any of its
         # regression components is an AR block (its own lags); a plain exogenous
@@ -1647,7 +1657,20 @@ class DLM:
         # Adapt/Wing: online RTRL discount learning happens inside fwd_filter, so
         # a discount-learning model looks like any other to the caller.
         kinds = [getattr(c, "_disc_rate_kind", "scalar") for c in self.components]
-        _wu = warmup_steps if warmup_steps is not None else 6
+        # ONE warmup number per model. It used to be two: the stamp said 0 when
+        # warmup_steps was None while the overlays were handed 6, so a
+        # None-compiled Wing/Adapt carried both at once. Nothing read the stamp,
+        # so the contradiction was invisible -- until uv_dlm.fwd_filter started
+        # reading it. Resolve here, at the source, and hand the same value to
+        # the model and to the overlay.
+        #
+        # A fixed-discount model still defaults to 0, so nothing about it moves.
+        # Only a learner gets DEFAULT_LEARNER_WARMUP, which is what the overlays
+        # already applied -- this relocates that default rather than changing it.
+        _learner = ("wing" in kinds) or ("adapt" in kinds)
+        _wu = (int(warmup_steps) if warmup_steps is not None
+               else (DEFAULT_LEARNER_WARMUP if _learner else 0))
+        result.warmup_steps = _wu
         if "wing" in kinds:
             import numpy as _np
             from .discount_grid import _grid_model

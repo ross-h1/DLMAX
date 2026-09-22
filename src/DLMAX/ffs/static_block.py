@@ -247,9 +247,11 @@ class StaticBlock:
                 "scan_filter over one.")
         y = jnp.asarray(np.asarray(yt, dtype=float))
         # Warmup is per STEP, as in the scan: inside the window the discount
-        # matrix is zeroed and the observational variance held. Without this the
-        # streaming face would filter the warmup window untreated and diverge
-        # from the batch path over exactly those observations.
+        # matrix is zeroed, so W = 0 and the state covariance evolves only
+        # through G. The observational variance is NOT held -- s/nu update
+        # normally, gated only by ignore_obs. Without this the streaming face
+        # would filter the warmup window untreated and diverge from the batch
+        # path over exactly those observations.
         warm = 1.0 if self._t < int(self.warmup or 0) else 0.0
         f, q = self._multi.fwd_filter(y, warmup_flag=warm)     # (nm, q) each
         self._dma_state, w = self._dma_step(

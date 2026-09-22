@@ -87,6 +87,28 @@ axis01dot = vmap(axis0dot, in_axes=[0, 0])
 # -----------------------------------------------------------------------------
 
 
+def resolve_warmup_flag(warmup_flag, warm_t, warmup_steps):
+    """Resolve one step's warmup flag. Explicit wins; ``None`` self-counts.
+
+    The single definition of the rule, shared by ``uv_dlm`` and
+    ``multi_model_dlm`` so the two engines cannot drift on it -- which is the
+    drift this whole area suffered from.
+
+    ``None`` means "ask the model where it is in its own warmup window", which
+    is how the FFS orchestrators behave (``StaticBlock``/``GridBlock`` keep a
+    ``_t`` and derive the flag from it). An explicit ``0.0``/``1.0`` forces the
+    step either way and is what every FFS caller passes, which is why this
+    resolver is unreachable from the FFS path and that path stays bit-identical.
+
+    An explicit flag does NOT suspend the counter: the window is a property of
+    how many observations the model has absorbed, not of how the caller chose to
+    label them.
+    """
+    if warmup_flag is not None:
+        return float(warmup_flag)
+    return 1.0 if warm_t < int(warmup_steps or 0) else 0.0
+
+
 class uv_dlm(object):
     """Univariate DLM applied in parallel across ``q`` series.
 
@@ -189,6 +211,8 @@ class uv_dlm(object):
             #                  means "adaptive" — see multi.forecast / _adapt_tau.)
             adapt=0.5,       # state-adaptive discount sensitivity; None = static
             #                  discount (disc_rates * disc_rates_damped).
+            warmup_steps=0,  # opening steps filtered with W=0 (discount held at
+            #                  1) while the initial state is learned. 0 = none.
     ):
         require_x64()
         if device is None:
@@ -302,10 +326,23 @@ class uv_dlm(object):
         # Per-step filtered trajectory, accumulated only when fwd_filter is
         # called with trajectory=True. See `trajectory` / `clear_trajectory`.
         self._traj = None
+        # Warmup: the window length, and the count of observations absorbed.
+        # Held HERE rather than in dlm_state because that dict is vmapped per
+        # series, stacked model-major by multi_model_dlm._init_from_dlms and
+        # sliced by enable_adapt/enable_wing -- a scalar step index in it would
+        # be packed as a bogus state slot. The counter is positional: it
+        # advances on every observation, NaN included, matching GridBlock's
+        # jnp.arange(_t, _t+T) < warmup and StaticBlock's _t.
+        self.warmup_steps = int(warmup_steps or 0)
+        self._warm_t = 0
 
     # ------------------------------------------------------------------
     # discount
     # ------------------------------------------------------------------
+
+    def _warm(self, warmup_flag):
+        """This step's warmup flag. See :func:`resolve_warmup_flag`."""
+        return resolve_warmup_flag(warmup_flag, self._warm_t, self.warmup_steps)
 
     def _disc_mtx(self):
         """Per-series discount factor matrices ``(1-delta)/delta``, shape (q, k, k).
@@ -434,7 +471,7 @@ class uv_dlm(object):
     # ------------------------------------------------------------------
 
     def fwd_filter(self, yt, regressors=None, Gt=None, intervention=None,
-                   trajectory=False):
+                   trajectory=False, warmup_flag=None):
         """Advance the filter by one observation for every series.
 
         Performs a single forward-filtering SVD update step (prior → posterior)
@@ -461,6 +498,19 @@ class uv_dlm(object):
             as ``T*q*p*p*8`` bytes, dominated by the covariance root ``Z``.
             Only ``{m, Z, s, nu}`` are kept — ``a_t`` and the prior root ``NR_t``
             are recomputable from them. Use :meth:`clear_trajectory` to reset.
+        warmup_flag : scalar 0.0/1.0 or None, default None
+            Whether to treat this step as part of the warmup window, in which
+            the discount is held at 1 so ``W = 0`` and the state covariance
+            evolves only through ``G``. The observational variance updates
+            normally — see :meth:`~multi_model_dlm.fwd_filter` for the full
+            statement of what warmup does and does not touch.
+
+            ``None`` (the default) means "use my own window": the model applies
+            the flag for its first :attr:`warmup_steps` observations, counting
+            positionally, exactly as ``StaticBlock``/``GridBlock`` do. An
+            explicit ``0.0``/``1.0`` forces the step and does not suspend the
+            count. With ``warmup_steps=0`` — every model compiled without the
+            option — this is a no-op and the step is bit-identical to before.
 
         Returns
         -------
@@ -509,6 +559,16 @@ class uv_dlm(object):
 
         disc_mtx = self._disc_mtx()
 
+        # Warmup: zero W for this step. Guarded at PYTHON level rather than
+        # multiplied unconditionally -- fwd_filter is not jitted, so `warm` is a
+        # concrete float here and the branch is legal. A no-op warmup therefore
+        # emits no op at all, so a model with warmup_steps=0 lowers to the
+        # identical HLO it did before this existed. (x * 1.0 == x is exact in
+        # IEEE, but "the graph is unchanged" is the stronger claim.)
+        warm = self._warm(warmup_flag)
+        if warm:
+            disc_mtx = disc_mtx * (1.0 - warm)
+
         # Broadcast variance_disc / variance_power / mult_comps to (n_series, ...)
         # for the vmap. They're stored as scalars (or 1D for mult_comps) on a
         # single uv_dlm; vdlm_uv_fwd_svd_step requires axis 0 to be n_series.
@@ -553,6 +613,7 @@ class uv_dlm(object):
                 v = self.dlm_state[k][: self.n_series]
                 self._traj[k].append(jnp.atleast_2d(v) if v.ndim == 1 else v)
 
+        self._warm_t += 1
         return ForecastBundle(
             self.model["f"][: self.n_series].reshape(self.n_series),
             self.model["q"][: self.n_series].reshape(self.n_series),
@@ -639,7 +700,7 @@ class uv_dlm(object):
         out["SC"] = S
         return out
 
-    def svd_fwd_filter(self, yt):
+    def svd_fwd_filter(self, yt, warmup_flag=None):
         """One filter step through the SVD kernel (non-differentiable fallback).
 
         Structural path only. Runs ``dlm_uv_fwd_svd_step`` via the reconstructed
@@ -647,6 +708,10 @@ class uv_dlm(object):
         QR-native. For long / ill-conditioned *pure*-filtering runs where SVD's
         per-step re-orthonormalisation is preferred over a QR root carried across
         thousands of steps; not a path for discount learning (use ``fwd_filter``).
+
+        ``warmup_flag`` carries the same contract as :meth:`fwd_filter`'s, and
+        shares the same counter -- the window belongs to the model, not to the
+        kernel a caller happens to drive it through.
         """
         svd_state = self.dlm_svd_state
         n = self.n_series + self.n_pad
@@ -662,6 +727,9 @@ class uv_dlm(object):
             disc_mtx = vmap(adapt_discount, in_axes=(0, 0, 0, None, None, None))(
                 svd_state["UC"], svd_state["SC"], svd_state["m"],
                 self.disc_rates, self.disc_rates_damped, self.adapt)
+        warm = self._warm(warmup_flag)
+        if warm:
+            disc_mtx = disc_mtx * (1.0 - warm)
         var_disc_b = jnp.broadcast_to(jnp.atleast_1d(self.variance_disc).reshape(-1)[:1], (n, 1))
         var_power_b = jnp.broadcast_to(jnp.atleast_1d(self.variance_power).reshape(-1)[:1], (n, 1))
         mult_b = jnp.broadcast_to(jnp.atleast_2d(self.mult_comps), (n, self.mult_comps.shape[-1]))
@@ -675,6 +743,7 @@ class uv_dlm(object):
             "s": new_svd["s"],
             "nu": new_svd["nu"],
         }
+        self._warm_t += 1
         return ForecastBundle(
             self.model["f"][: self.n_series].reshape(self.n_series),
             self.model["q"][: self.n_series].reshape(self.n_series),
@@ -707,12 +776,19 @@ class uv_dlm(object):
             "lo": float(_np.log(clip[0] / (1 - clip[0]))),
             "hi": float(_np.log(clip[1] / (1 - clip[1]))),
             "learn": jnp.asarray(learn, dtype=bool),
-            "warmup": int(warmup), "step": 0, "t": 0.0,
+            # "warmup" mirrors self.warmup_steps: AdaptiveBlock.from_cells
+            # reads the wing analogue to rebuild a block, so the carry keeps
+            # advertising the window even though the filter now reads the
+            # model's. "step" is gone -- see _adapt_fwd_filter.
+            "warmup": int(warmup), "t": 0.0,
             "wth": jnp.broadcast_to(jnp.log(theta0 / (1 - theta0)), (q, P)),
             "S": {k: jnp.zeros((q, P) + v.shape[1:]) for k, v in st.items()},
             "m": jnp.zeros((q, P)), "v": jnp.zeros((q, P)),
         }
         self.dlm_state = st           # drop the monitor slot; adapt owns learning
+        # The overlay's window IS the model's window -- one clock, one number.
+        self.warmup_steps = int(warmup)
+        self._warm_t = 0
         return self
 
     def _adapt_fwd_filter(self, yt):
@@ -722,7 +798,14 @@ class uv_dlm(object):
         gm, P, lr = a["gm"], a["P"], a["lr"]
         lo, hi, learn = a["lo"], a["hi"], a["learn"]
         y = jnp.asarray(yt).reshape(-1)[: self.n_series]
-        warm = 1.0 if a["step"] < a["warmup"] else 0.0
+        # One warmup clock per model (self._warm_t + self.warmup_steps), shared
+        # with fwd_filter/svd_fwd_filter rather than a private a["step"]. On a
+        # learner model fwd_filter always routes here (the short-circuit at the
+        # top of fwd_filter), and nothing else advances the count, so the
+        # sequence is identical to the private counter it replaces. a["t"], the
+        # Adam timestep below, is a DIFFERENT clock -- gated on `act`, not on
+        # observations -- and is deliberately left alone.
+        warm = 1.0 if self._warm_t < int(self.warmup_steps or 0) else 0.0
         act = warm < 0.5
         if act:
             a["t"] = a["t"] + 1.0
@@ -758,7 +841,7 @@ class uv_dlm(object):
             self.dlm_state, a["S"], a["wth"], a["m"], a["v"], y)
         self.dlm_state = ns
         a["S"], a["wth"], a["m"], a["v"], a["g_ls"] = S_new, wth_n, m_n, v_n, g_ls
-        a["step"] += 1
+        self._warm_t += 1
         self.model = md
         return ForecastBundle(
             md["f"].reshape(self.n_series), md["q"].reshape(self.n_series))
@@ -818,19 +901,23 @@ class uv_dlm(object):
             "gm": gm, "P": P, "offsets": offsets, "lo": lo, "hi": hi,
             "use_ls": jnp.zeros(P, bool).at[gm.n_blocks].set(True),
             "mi": mi, "upd": _dma_update(DMA_PDR, DMA_MDR, DMA_C),
-            "lr": float(lr), "warmup": int(warmup), "step": 0, "wings": int(wings),
+            "lr": float(lr), "warmup": int(warmup), "wings": int(wings),
             "w": jnp.ones((q, wings)) / wings,     # last DMA weights (q, wings)
             "carry": (st3, S3, jnp.full((q,), c0s), zc, zc, wth0,
                       jnp.zeros((q, wings, P)), jnp.zeros((q, wings, P)),
                       alloc0, jnp.zeros((q,))),
         }
+        # The overlay's window IS the model's window -- one clock, one number.
+        self.warmup_steps = int(warmup)
+        self._warm_t = 0
         return self
 
     def _wing_fwd_filter(self, yt):
         from DLMAX.ffs.discount_grid import _wing_step
         w = self._wing
         y = jnp.asarray(yt).reshape(-1)[: self.n_series]
-        wrm = jnp.asarray(1.0 if w["step"] < w["warmup"] else 0.0)
+        wrm = jnp.asarray(
+            1.0 if self._warm_t < int(self.warmup_steps or 0) else 0.0)
 
         def step_fn(carry, yi):
             return _wing_step(carry, yi, wrm, model=w["gm"], offsets=w["offsets"],
@@ -841,7 +928,7 @@ class uv_dlm(object):
         new_carry, out = vmap(step_fn)(w["carry"], y)         # cell per series
         w["carry"] = new_carry
         w["w"] = out["w"]                                     # (q, wings)
-        w["step"] += 1
+        self._warm_t += 1
         # DMA-combine the wingmen per series: mean + quantile-avg sd; the
         # state-contribution v_sys is the DMA-weighted average over the wingmen.
         f, qv, wt = out["f"], out["q"], out["w"]              # (q, wings)
@@ -1114,6 +1201,18 @@ class multi_model_dlm(object):
         self.exog_regressors = bool(self.n_regressors > 0) and not any(
             getattr(d, "is_autoregressive", False) for d in dlms.values()
         )
+        # Warmup window, inherited from the packed members exactly as
+        # is_autoregressive is above -- the builder stamps it per model and
+        # packing used to throw it away. MAX when members disagree, mirroring
+        # AutoFFS._warmup_target: a member with a shorter window simply filters
+        # the remaining warmup rows normally, as it would on its own. A
+        # hand-built or legacy universe whose members carry nothing gets 0, so
+        # it is bit-exact with the behaviour before this existed.
+        self.warmup_steps = max(
+            (int(getattr(d, "warmup_steps", 0) or 0) for d in dlms.values()),
+            default=0,
+        )
+        self._warm_t = 0
 
         # state dict: stack on model axis, then flatten (nm, q, ...) -> (p, ...).
         # Pad the k-sized state to K: m/SC append 0, UC gets an identity block;
@@ -1253,6 +1352,13 @@ class multi_model_dlm(object):
                 "k": self.k,
                 "npad": self.npad,
                 "mdl_keys": self.mdl_keys,
+                # Warmup window and its counter. Both, not just the window: a
+                # universe reopened mid-warmup with the counter reset would
+                # re-warm rows it has already absorbed. GridBlock persists its
+                # _t for the same reason. In `dims` rather than the Other loop
+                # below, which device_puts its values into arrays.
+                "warmup_steps": int(getattr(self, "warmup_steps", 0) or 0),
+                "warm_t": int(getattr(self, "_warm_t", 0) or 0),
             }
             for param, val in dims.items():
                 g.create_dataset(param, data=val)
@@ -1314,6 +1420,12 @@ class multi_model_dlm(object):
                 s.decode() if isinstance(s, bytes) else str(s)
                 for s in g["mdl_keys"][()]
             ]
+            # Back-compat: a universe persisted before warmup was inherited from
+            # the members has neither field. 0/0 is exactly what those files
+            # behaved as -- no window, and a counter already past it.
+            self.warmup_steps = (
+                int(g["warmup_steps"][()]) if "warmup_steps" in g else 0)
+            self._warm_t = int(g["warm_t"][()]) if "warm_t" in g else 0
 
             g = f["Other"]
             for param in [
@@ -1545,8 +1657,12 @@ class multi_model_dlm(object):
             return mon.reshape(-1)
         return None
 
+    def _warm(self, warmup_flag):
+        """This step's warmup flag. See :func:`resolve_warmup_flag`."""
+        return resolve_warmup_flag(warmup_flag, self._warm_t, self.warmup_steps)
+
     def fwd_filter(self, yt, regressors=None, Gt=None, monitor=True,
-                   warmup_flag=0.0):
+                   warmup_flag=None):
         """Advance the whole universe by one observation.
 
         Single forward-filtering step over the packed ``(n_models * n_series)``
@@ -1566,10 +1682,20 @@ class multi_model_dlm(object):
             Reserved; not currently applied.
         warmup_flag : scalar 0.0/1.0, default 0.0
             Treat this step as part of the warmup window: the discount matrix is
-            zeroed (no variance inflation) and the observational variance
-            estimate is held. The scan path has always applied this per step
-            (``warmup_flag_t`` in its carry); exposing it here lets a caller
-            driving the filter ONE STEP AT A TIME reproduce the scan over the
+            zeroed, so ``W = 0`` for this step and the state covariance evolves
+            only through ``G``, with no forgetting inflation.
+
+            That is the WHOLE effect on the filter. The observational variance
+            (``s``, ``nu``) updates normally -- it is gated only by
+            ``ignore_obs`` (a NaN observation), never by warmup. The one other
+            quantity warmup touches is the monitor's signed-error EWMA
+            ``dlm_state["S"]``, held so the diffuse-prior transient does not
+            poison it, and only on an adaptive (``tau``) universe.
+
+            The CV/streaming scan in ``ffs_core`` (``_build_filter_scan_step``,
+            ``_build_emit_scan_step``) has always applied this per step, as
+            ``warmup_flag_t`` in its scan inputs; exposing it here lets a caller
+            driving the filter ONE STEP AT A TIME reproduce that scan over the
             same window, which it could not before. Default 0.0 leaves every
             existing caller bit-identical.
         monitor : bool, default True
@@ -1624,15 +1750,17 @@ class multi_model_dlm(object):
             device_put(
                 pad(yt, self.npad) * jnp.ones((self.nm, 1)), self.dlm_compute
             ).reshape(self.p),
-            warmup_flag,
+            self._warm(warmup_flag),
             regressors=reg_t,
             reg_mask=getattr(self, "reg_mask", None),
             tau=self._monitor_tau(monitor),
         )
 
+        self._warm_t += 1
         return ForecastBundle(f, q)
 
-    def scan_filter(self, ys, regressors=None, update_state=True, monitor=True):
+    def scan_filter(self, ys, regressors=None, update_state=True, monitor=True,
+                    warmup_flag=None):
         """Run the multi-model forward filter over a whole series in one
         compiled ``lax.scan`` — the multi-level analogue of the single-step
         :meth:`fwd_filter`, and the standalone driver for a regression/AR
@@ -1701,29 +1829,73 @@ class multi_model_dlm(object):
             self.dlm_compute,
         )
 
-        if regressors is None:
-            def step(state, y_t):
-                new_state, _model, f, q = _multi_fwd_filter_step(
-                    state, multi_params, y_t, reg_mask=reg_mask, tau=tau,
-                )
-                return new_state, (f, q)
+        # Per-step warmup flags, from the counter OFFSET so a chunked scan does
+        # not re-warm rows it has already absorbed -- the same construction
+        # GridBlock.scan_filter uses (jnp.arange(_t, _t + T) < warmup).
+        #
+        # warm_vec stays None once the window is behind us, which is the case
+        # for every caller that has ever used this method (warmup_steps is 0
+        # unless the packed members carried one). That keeps the scan's xs arity
+        # and its Python-constant 0.0 default exactly as they were: the
+        # arithmetic would be identical either way, since x * 1.0 == x is exact,
+        # but a traced flag would change the emitted graph and "the graph is
+        # unchanged" is the claim worth being able to make.
+        ws = int(self.warmup_steps or 0)
+        warm_vec = None
+        if warmup_flag is not None:
+            warm_vec = jnp.broadcast_to(
+                jnp.asarray(float(warmup_flag), Y.dtype), (T,))
+        elif ws > self._warm_t:
+            warm_vec = (jnp.arange(self._warm_t, self._warm_t + T)
+                        < ws).astype(Y.dtype)
 
-            final_state, (f, q) = scan(step, init_state, Y)
+        if regressors is None:
+            if warm_vec is None:
+                def step(state, y_t):
+                    new_state, _model, f, q = _multi_fwd_filter_step(
+                        state, multi_params, y_t, reg_mask=reg_mask, tau=tau,
+                    )
+                    return new_state, (f, q)
+
+                final_state, (f, q) = scan(step, init_state, Y)
+            else:
+                def step(state, xs):
+                    y_t, warm_t = xs
+                    new_state, _model, f, q = _multi_fwd_filter_step(
+                        state, multi_params, y_t, warm_t,
+                        reg_mask=reg_mask, tau=tau,
+                    )
+                    return new_state, (f, q)
+
+                final_state, (f, q) = scan(step, init_state, (Y, warm_vec))
         else:
             regressors = device_put(jnp.asarray(regressors), self.dlm_compute)
 
-            def step(state, xs):
-                y_t, reg_t = xs
-                new_state, _model, f, q = _multi_fwd_filter_step(
-                    state, multi_params, y_t,
-                    regressors=reg_t, reg_mask=reg_mask, tau=tau,
-                )
-                return new_state, (f, q)
+            if warm_vec is None:
+                def step(state, xs):
+                    y_t, reg_t = xs
+                    new_state, _model, f, q = _multi_fwd_filter_step(
+                        state, multi_params, y_t,
+                        regressors=reg_t, reg_mask=reg_mask, tau=tau,
+                    )
+                    return new_state, (f, q)
 
-            final_state, (f, q) = scan(step, init_state, (Y, regressors))
+                final_state, (f, q) = scan(step, init_state, (Y, regressors))
+            else:
+                def step(state, xs):
+                    y_t, reg_t, warm_t = xs
+                    new_state, _model, f, q = _multi_fwd_filter_step(
+                        state, multi_params, y_t, warm_t,
+                        regressors=reg_t, reg_mask=reg_mask, tau=tau,
+                    )
+                    return new_state, (f, q)
+
+                final_state, (f, q) = scan(
+                    step, init_state, (Y, regressors, warm_vec))
 
         if update_state:
             self.dlm_state = final_state
+            self._warm_t += T
         return ForecastBundle(f, q)
 
     def _forecast_disc_factor_vec(self):

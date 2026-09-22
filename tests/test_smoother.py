@@ -213,8 +213,16 @@ def test_rank_deficient_prior_uses_pseudo_inverse():
 
     # and the failure mode this guards: a triangular solve against the same NR
     # blows up, which is what the previous implementation did.
-    Tri = np.linalg.qr(np.asarray(NR), mode="r")
-    assert np.min(np.abs(np.diag(Tri))) < 1e-8, "R really is rank-deficient here"
+    #
+    # Checked as a RATIO, not an absolute floor. C0 is exactly singular, but the
+    # smallest diagonal of NR's R factor lands at ~sqrt(eps) rather than ~eps,
+    # so an absolute 1e-8 sits exactly on the boundary and the answer depends on
+    # the LAPACK underneath: macOS Accelerate returns just under, Linux OpenBLAS
+    # just over (1.06e-8 observed). The ratio is unambiguous either way -- the
+    # other diagonals are 0.7-1.0, six orders away -- and it is the scale-free
+    # statement of what is meant: this matrix is rank-deficient.
+    d = np.abs(np.diag(np.linalg.qr(np.asarray(NR), mode="r")))
+    assert d.min() / d.max() < 1e-7, "R really is rank-deficient here"
 
 
 @pytest.mark.parametrize("var_power", [1.0, 0.5, 0.25])

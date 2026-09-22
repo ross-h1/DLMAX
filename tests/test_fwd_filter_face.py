@@ -353,3 +353,135 @@ def test_flush_is_a_noop_when_nothing_pending(tmp_path):
     u = _uni(tmp_path, "noop", hist)
     assert u.flush() is u
     u.flush()
+
+
+# --------------------------------------------------------------------------
+# The LABELLED step face: a Series keyed by series id
+# --------------------------------------------------------------------------
+# ``df.iloc[t]`` is already a Series indexed by the series ids and NAMED by the
+# timestamp, so a caller stepping through a frame carries identification and
+# calendar without being asked for them separately. These tests pin that the
+# labels are USED (not merely tolerated), that they do not change any number,
+# and that matching is by label rather than by position.
+
+def _wide(n=T, seed=0):
+    return _panel(n, seed).pivot(index="ds", columns="unique_id", values="y")[
+        [f"s{j}" for j in range(Q)]]
+
+
+def _drive(m, wide, rows, how):
+    out = []
+    for i in rows:
+        if how == "array":
+            out.append(m.fwd_filter(wide.iloc[i].to_numpy()))
+        elif how == "series":
+            out.append(m.fwd_filter(wide.iloc[i]))
+        elif how == "frame":
+            out.append(m.fwd_filter(wide.iloc[[i]]))
+    return out
+
+
+@pytest.mark.parametrize("how", ["series", "frame"])
+def test_labelled_input_does_not_change_the_numbers(how):
+    """Labels identify; they do not compute. Bitwise equal to the array path."""
+    w = _wide()
+    rows = range(_single()._warmup_target() + 2)
+    a = _drive(_single(), w, rows, "array")
+    m = _single()
+    b = _drive(m, w, rows, how)
+    for x, y in zip(a, b):
+        np.testing.assert_array_equal(np.asarray(x.loc), np.asarray(y.loc))
+        np.testing.assert_array_equal(np.asarray(x.var), np.asarray(y.var))
+
+
+def test_labelled_input_returns_plain_arrays():
+    """The return is arrays whatever goes in — one return type, no per-step
+    pandas construction. ``forecast`` is where the labels come back."""
+    w = _wide()
+    m = _single()
+    out = _drive(m, w, range(m._warmup_target() + 1), "series")[-1]
+    assert isinstance(out.loc, np.ndarray) and out.loc.shape == (Q,)
+    assert isinstance(out.var, np.ndarray)
+
+
+def test_series_names_the_panel_and_the_calendar():
+    """The counterpart of ``test_self_init_names_series_positionally``: given
+    labels, self-init uses them instead of ``s0``… and an integer count."""
+    w = _wide()
+    w.columns = [f"real_{j}" for j in range(Q)]
+    m = _single()
+    _drive(m, w, range(m._warmup_target() + 2), "series")
+    out = m.forecast(h=2)
+    assert set(out["unique_id"]) == set(w.columns)
+    assert np.issubdtype(np.asarray(out["ds"]).dtype, np.datetime64)
+    # dates continue the input calendar rather than restarting a count
+    assert pd.Timestamp(sorted(out["ds"])[0]) == w.index[m._warmup_target() + 1] \
+        + pd.tseries.frequencies.to_offset("MS")
+
+
+def test_matching_is_by_label_not_position():
+    """A reordered frame must not mis-assign — the failure the array form
+    cannot see, and the reason ``update`` matches on ``unique_id``."""
+    w = _wide()
+    n = _single()._warmup_target() + 3
+    straight = _single()
+    _drive(straight, w, range(n), "series")
+
+    shuffled = _single()
+    cut = _single()._warmup_target()
+    _drive(shuffled, w, range(cut), "series")           # name the panel
+    for i in range(cut, n):                              # then feed it reversed
+        shuffled.fwd_filter(w.iloc[i][w.columns[::-1]])
+
+    key = ["unique_id", "ds"]
+    a = straight.forecast(h=2).sort_values(key).reset_index(drop=True)
+    b = shuffled.forecast(h=2).sort_values(key).reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_rejects_a_missing_or_unknown_series():
+    """The two-sided contract ``update(df_new)`` enforces, for one step."""
+    w = _wide()
+    m = _single()
+    _drive(m, w, range(m._warmup_target()), "series")
+    nxt = w.iloc[m._warmup_target()]
+    with pytest.raises(ValueError, match="missing fitted series"):
+        m.fwd_filter(nxt.drop(w.columns[1]))
+    with pytest.raises(ValueError, match="not fitted"):
+        m.fwd_filter(pd.concat([nxt, pd.Series({"ghost": 1.0})]))
+
+
+def test_rejects_a_multi_row_frame():
+    m = _single()
+    with pytest.raises(ValueError, match="takes ONE observation"):
+        m.fwd_filter(_wide().iloc[:2])
+
+
+def test_short_warmup_keeps_the_integer_calendar():
+    """Below three timestamps ``infer_freq`` cannot identify a calendar, so the
+    honest result is today's integer count — the ids are still adopted."""
+    w = _wide()
+    m = AutoFFS(blocks=[GridBlock.build(period=PERIOD, warmup=2)], learn_dma=False)
+    assert m._warmup_target() == 2
+    _drive(m, w, range(4), "series")
+    out = m.forecast(h=2)
+    assert set(out["unique_id"]) == set(w.columns)          # ids: adopted
+    assert np.issubdtype(np.asarray(out["ds"]).dtype, np.integer)  # calendar: not
+
+
+def test_universe_matching_is_by_label(tmp_path):
+    """``AutoFFSUniverse`` carries the same manifest-order contract, and gains
+    the same label-matched escape from it."""
+    df = _panel(T + K)
+    hist, _new, wide = _split(df)
+    ids = [f"s{j}" for j in range(Q)]
+    pos = _uni(tmp_path, "pos", hist)
+    lab = _uni(tmp_path, "lab", hist)
+    for i in range(K):
+        pos.fwd_filter(wide[i], persist=False)
+        # same row, reversed labels: the Series must be realigned
+        lab.fwd_filter(pd.Series(wide[i][::-1], index=ids[::-1]), persist=False)
+    key = ["unique_id", "ds"]
+    a = pos.forecast(h=H).sort_values(key).reset_index(drop=True)
+    b = lab.forecast(h=H).sort_values(key).reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b)
